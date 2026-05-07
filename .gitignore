@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Training artifacts
+checkpoints/
+mmsdk_cache/
+
+# Mac
+.DS_Store
+
+# HuggingFace cache
+~/.cache/
+
+# Misc
+workspace/
