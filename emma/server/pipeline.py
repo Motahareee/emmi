@@ -68,9 +68,14 @@ SCENARIO_REGISTRY = {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_llm(scenario: str, load_in_8bit: bool = False):
+def _load_llm(scenario: str, load_in_8bit: bool = False, dtype: str = "float16"):
     """
     Load the LLM backbone for the given scenario.
+
+    dtype: "float16" (default, matches all prior runs) or "float32" -- diagnostic
+    option to rule out fp16's limited dynamic range (~65504 max) as the cause of
+    the non-finite-gradient instability seen on some (compressor, encoder) pairs.
+    Ignored when load_in_8bit=True (quantized weights aren't touched by this).
 
     Returns (llm_module, d_llm) where llm_module is an nn.Module that
     accepts inputs_embeds + attention_mask and returns an object with
@@ -79,16 +84,28 @@ def _load_llm(scenario: str, load_in_8bit: bool = False):
     entry  = SCENARIO_REGISTRY[scenario]
     name   = entry["model_name"]
     loader = entry["loader"]
+    torch_dtype = {"float16": torch.float16, "float32": torch.float32}[dtype]
 
     kwargs = dict(output_hidden_states=True)
     if load_in_8bit:
-        kwargs["load_in_8bit"] = True       # requires bitsandbytes
+        from transformers import BitsAndBytesConfig
+        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)  # requires bitsandbytes
 
     if loader == "llava":
         from transformers import LlavaForConditionalGeneration
         model  = LlavaForConditionalGeneration.from_pretrained(name, **kwargs)
-        llm    = model.language_model        # LlamaForCausalLM
+        llm    = model.model.language_model  # LlamaForCausalLM (nested under .model in transformers>=5.x)
         d_llm  = model.config.text_config.hidden_size
+        if not load_in_8bit:
+            # Some params (e.g. RMSNorm weights) can load in fp32 even when the
+            # checkpoint is otherwise fp16, causing an internal dtype mismatch
+            # partway through the forward pass. Normalize the whole backbone
+            # to one dtype so every layer sees consistent input. Using
+            # torch_dtype here (rather than always float16) lets a caller
+            # request genuine fp32 -- unlike the load_in_8bit=False default,
+            # that actually removes fp16's dynamic-range ceiling instead of
+            # just avoiding the dtype-mismatch crash while staying in fp16.
+            llm = llm.to(dtype=torch_dtype)
 
     elif loader == "qwen_audio":
         from transformers import Qwen2AudioForConditionalGeneration
@@ -130,38 +147,57 @@ class ServerPipeline(nn.Module):
     """
     Server-side pipeline for all three scenarios.
 
-    Multi-task: a single LLM produces one shared hidden state that is
-    passed to two independent task heads simultaneously —
-        sentiment_head  → regression  (continuous score, MSE loss)
-        emotion_head    → multi-label classification (6 emotions, BCE loss)
-
-    This demonstrates that one server-side LLM can serve multiple tasks
-    from the same compressed multimodal representation.
+    Task: binary image-text matching.
+        match_head → 1 logit (apply sigmoid for probability; BCE loss)
 
     Forward returns:
-        {
-            "sentiment": [B, 1]   raw regression score
-            "emotions":  [B, 6]   raw logits (apply sigmoid for probabilities)
-        }
+        {"match": [B, 1]}  raw logit (positive = image matches caption)
     """
 
     def __init__(self, llm: nn.Module, d_llm: int,
                  projection: nn.Module,
-                 sentiment_head: nn.Module,
-                 emotion_head: nn.Module,
+                 match_head: nn.Module,
                  n_soft_tokens: int, freeze_llm: bool = True,
-                 vae_decoder: VAEDecoder = None):
+                 vae_decoder: VAEDecoder = None,
+                 debug: bool = False, debug_max_calls: int = 3,
+                 debug_every: int = 0, debug_max_track: int = 200):
         super().__init__()
-        self.vae_decoder    = vae_decoder
-        self.projection     = projection
-        self.llm            = llm
-        self.sentiment_head = sentiment_head
-        self.emotion_head   = emotion_head
-        self.n_soft_tokens  = n_soft_tokens
+        self.vae_decoder   = vae_decoder
+        self.projection    = projection
+        self.llm           = llm
+        self.match_head    = match_head
+        self.n_soft_tokens = n_soft_tokens
+
+        # Opt-in diagnostic instrumentation -- off by default and a no-op for
+        # every existing caller unless debug=True is passed explicitly.
+        #  - debug_max_calls: full stage-by-stage dump for the first N calls
+        #    (min/max/isnan/isinf at each point in forward()).
+        #  - debug_every: if >0, a lightweight one-line snapshot (projection
+        #    weight norm + soft-token magnitude) every debug_every calls,
+        #    capped at debug_max_track lines -- lets us see whether the
+        #    projection's weights/outputs grow over the course of training,
+        #    not just in the first few calls.
+        #  - the first time any non-finite value appears anywhere, a full
+        #    dump fires once regardless of the above counters, to capture
+        #    exactly where/when it happens.
+        self.debug              = debug
+        self.debug_max_calls    = debug_max_calls
+        self.debug_every        = debug_every
+        self.debug_max_track    = debug_max_track
+        self._debug_calls       = 0
+        self._debug_call_idx    = 0
+        self._debug_track_lines = 0
+        self._debug_first_bad_reported = False
 
         if freeze_llm:
             for param in self.llm.parameters():
                 param.requires_grad = False
+
+    def _debug_tensor(self, name: str, t: torch.Tensor):
+        with torch.no_grad():
+            print(f"    [debug]   {name}: dtype={t.dtype} "
+                  f"min={t.min().item():.4g} max={t.max().item():.4g} "
+                  f"isnan={torch.isnan(t).any().item()} isinf={torch.isinf(t).any().item()}")
 
     def forward(self, z: torch.Tensor,
                 input_ids: torch.Tensor,
@@ -175,28 +211,93 @@ class ServerPipeline(nn.Module):
         soft = self.projection(emb)                            # [B, n * d_llm]
         soft = soft.view(B, self.n_soft_tokens, -1)            # [B, n, d_llm]
 
+        self._debug_call_idx += 1
+
+        debug_this_call = self.debug and self._debug_calls < self.debug_max_calls
+        if debug_this_call:
+            self._debug_calls += 1
+            print(f"  [debug] ServerPipeline.forward call {self._debug_calls}/{self.debug_max_calls}")
+            self._debug_tensor("z (input)",            z)
+            self._debug_tensor("emb (post vae_decode)", emb)
+            self._debug_tensor("soft (post projection)", soft)
+
+        debug_track = (self.debug and self.debug_every > 0
+                       and self._debug_track_lines < self.debug_max_track
+                       and self._debug_call_idx % self.debug_every == 0)
+        if debug_track:
+            self._debug_track_lines += 1
+            with torch.no_grad():
+                proj_w_norm = sum(p.norm().item() for p in self.projection.parameters())
+                print(f"  [debug-track] call {self._debug_call_idx}: "
+                      f"projection_weight_norm={proj_w_norm:.4g} "
+                      f"soft_absmax={soft.abs().max().item():.4g} "
+                      f"soft_isfinite={torch.isfinite(soft).all().item()}")
+
         # --- Build combined input embeddings --------------------------
         text_emb  = self.llm.get_input_embeddings()(input_ids) # [B, L, d_llm]
-        combined  = torch.cat([soft, text_emb], dim=1)         # [B, n+L, d_llm]
+        llm_dtype = next(self.llm.parameters()).dtype
+        combined  = torch.cat([soft, text_emb], dim=1).to(dtype=llm_dtype)  # [B, n+L, d_llm]
+
+        if debug_this_call:
+            self._debug_tensor("text_emb",                text_emb)
+            self._debug_tensor("combined (post cast)",     combined)
 
         soft_mask = torch.ones(B, self.n_soft_tokens,
                                device=z.device,
                                dtype=attention_mask.dtype)
         full_mask = torch.cat([soft_mask, attention_mask], dim=1)  # [B, n+L]
 
-        # --- LLM forward — one pass, shared representation -----------
+        # --- LLM forward ----------------------------------------------
         out = self.llm(
             inputs_embeds=combined,
             attention_mask=full_mask,
             output_hidden_states=True,
         )
-        last_hidden = out.hidden_states[-1][:, -1, :]          # [B, d_llm]
 
-        # --- Two task heads on the same hidden state -----------------
-        return {
-            "sentiment": self.sentiment_head(last_hidden),     # [B, 1]
-            "emotions":  self.emotion_head(last_hidden),       # [B, 6]
-        }
+        if debug_this_call:
+            first_bad = None
+            for i, h in enumerate(out.hidden_states):
+                if torch.isnan(h).any() or torch.isinf(h).any():
+                    first_bad = i
+                    break
+            if first_bad is None:
+                print(f"    [debug]   all {len(out.hidden_states)} hidden_states "
+                      f"(embeddings + each layer) are finite")
+            else:
+                print(f"    [debug]   FIRST non-finite hidden_states at index {first_bad} "
+                      f"(0=embeddings, 1..N=after layer i) out of {len(out.hidden_states)}")
+                self._debug_tensor(f"hidden_states[{first_bad}]", out.hidden_states[first_bad])
+                self._debug_first_bad_reported = True
+        elif self.debug and not self._debug_first_bad_reported:
+            # Beyond the first debug_max_calls: still watch for the FIRST
+            # non-finite forward anywhere, and dump full context exactly
+            # when/where it happens -- this is what actually tells us
+            # whether the projection has drifted into instability partway
+            # through training, rather than only seeing healthy early calls.
+            bad_idx = None
+            for i, h in enumerate(out.hidden_states):
+                if torch.isnan(h).any() or torch.isinf(h).any():
+                    bad_idx = i
+                    break
+            if bad_idx is not None:
+                self._debug_first_bad_reported = True
+                print(f"  [debug] FIRST non-finite forward at call {self._debug_call_idx} "
+                      f"(hidden_states index {bad_idx} of {len(out.hidden_states)})")
+                self._debug_tensor("z (input)",              z)
+                self._debug_tensor("soft (post projection)", soft)
+                with torch.no_grad():
+                    proj_w_norm = sum(p.norm().item() for p in self.projection.parameters())
+                    print(f"    [debug]   projection weight norm at failure: {proj_w_norm:.4g}")
+                self._debug_tensor(f"hidden_states[{bad_idx}]", out.hidden_states[bad_idx])
+
+        # match_head may be a different (e.g. fp32) dtype than the LLM backbone
+        last_hidden = out.hidden_states[-1][:, -1, :].to(dtype=self.match_head.weight.dtype)  # [B, d_llm]
+
+        if debug_this_call:
+            self._debug_tensor("last_hidden (final)", last_hidden)
+
+        # --- Binary classification head -------------------------------
+        return {"match": self.match_head(last_hidden)}         # [B, 1]
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +313,7 @@ def create_server_pipeline(config: EMMAConfig = None,
     Pass the path via vae_checkpoint; if None the decoder is randomly
     initialised (useful only for architecture tests).
 
-    Trainable components:   vae_decoder, projection, sentiment_head, emotion_head
+    Trainable components:   vae_decoder, projection, match_head
     Frozen by default:      llm backbone
     """
     cfg = config or EMMAConfig()
@@ -234,17 +335,15 @@ def create_server_pipeline(config: EMMAConfig = None,
     else:
         vae_decoder = None
 
-    projection     = _build_projection(ac.d_shared, sc.n_soft_tokens, d_llm)
-    sentiment_head = nn.Linear(d_llm, 1)
-    emotion_head   = nn.Linear(d_llm, 6)
+    projection = _build_projection(ac.d_shared, sc.n_soft_tokens, d_llm)
+    match_head = nn.Linear(d_llm, 1)
 
     return ServerPipeline(
         llm=llm,
         d_llm=d_llm,
         vae_decoder=vae_decoder,
         projection=projection,
-        sentiment_head=sentiment_head,
-        emotion_head=emotion_head,
+        match_head=match_head,
         n_soft_tokens=sc.n_soft_tokens,
         freeze_llm=sc.freeze_llm,
     )
