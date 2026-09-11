@@ -15,3 +15,4 @@ mmsdk_cache/
 
 # Misc
 workspace/
+.coco_cache/

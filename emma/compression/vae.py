@@ -32,7 +32,9 @@ class VAEEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor):
         h = self.encoder(x)
-        return self.fc_mu(h), self.fc_log_var(h)
+        mu      = self.fc_mu(h)
+        log_var = self.fc_log_var(h).clamp(-10, 4)   # prevent exp overflow / total collapse
+        return mu, log_var
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Inference path — returns μ only (no sampling, no log_var)."""
@@ -127,20 +129,33 @@ class VAE(nn.Module):
 
 def vae_loss(recon: torch.Tensor, target: torch.Tensor,
              mu: torch.Tensor, log_var: torch.Tensor,
-             beta: float = 1.0) -> dict:
+             beta: float = 1.0, free_bits: float = 0.5) -> dict:
     """
-    β-VAE loss = reconstruction MSE + β * KL divergence.
+    β-VAE loss with free-bits regularisation to prevent posterior collapse.
+
+    Loss = recon_MSE + β * sum_d max(KL_d, free_bits)
+
+    free_bits: minimum KL nats per latent dimension.  Dimensions below this
+               threshold get zero KL gradient, letting reconstruction loss
+               push them to encode real information before regularisation
+               pressure kicks in.  Typical values: 0.5 – 2.0 nats/dim.
 
     Args:
-        recon   : decoder output [B, d_shared]
-        target  : original fused embedding [B, d_shared]  (reconstruction target)
-        mu      : encoder mean [B, d_latent]
-        log_var : encoder log variance [B, d_latent]
-        beta    : KL weight — increase to tighten the bottleneck
+        recon      : decoder output [B, d_shared]
+        target     : original fused embedding [B, d_shared]
+        mu         : encoder mean [B, d_latent]
+        log_var    : encoder log variance [B, d_latent]
+        beta       : KL weight (use warmup scheduler in train.py)
+        free_bits  : min KL per dimension before penalty applies
 
     Returns dict with 'loss', 'recon_loss', 'kl_loss' for logging.
     """
     recon_loss = F.mse_loss(recon, target, reduction="mean")
-    kl_loss    = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
-    loss       = recon_loss + beta * kl_loss
+
+    # Per-dimension KL: [B, d_latent] → mean over batch → [d_latent]
+    kl_per_dim = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())
+    kl_per_dim = kl_per_dim.mean(0)                          # [d_latent]
+    kl_loss    = kl_per_dim.clamp(min=free_bits).mean()      # scalar
+
+    loss = recon_loss + beta * kl_loss
     return {"loss": loss, "recon_loss": recon_loss, "kl_loss": kl_loss}
