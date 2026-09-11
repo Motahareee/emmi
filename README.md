@@ -1,113 +1,144 @@
-# EMMA — Edge Multimodal Model Architecture
+# EMMI
 
-EMMA is a lightweight multimodal AI inference pipeline designed for edge devices. It encodes multimodal inputs on-device and offloads high-level reasoning to a server-side LLM, optimizing for inference latency.
+EMMI is a lightweight multimodal AI inference pipeline for edge-server split deployment. It encodes and compresses multimodal inputs on-device, transmits a compact latent representation, and offloads reasoning to a server-side language model — optimizing for inference latency and communication payload while preserving task accuracy.
+
+The task is **binary image-text matching** on MS-COCO: given an image and a caption, does the caption describe the image?
+
+> **Note on naming:** the Python package and all imports (`emma/`, `from emma.config import ...`, etc.) still use the original codename `emma` — only the project's public name has moved to EMMI.
 
 ## Overview
 
 ```
-[Raw Input]
+[Raw Input: image + caption]
      │
      ▼
-Stage 1 — Modality Encoders (edge)
-     Text   → DistilBERT-base (frozen) + linear projection → 256-dim
-     Audio  → Whisper-small encoder (frozen) + linear projection → 256-dim
+Stage 1 — Modality Encoders (edge, frozen)
+     Text + Image  → CLIP (ViT-B/32) or MobileCLIP2-S0  → 512-dim each
      │
      ▼
 Stage 2 — Cross-Modal Alignment (edge)
-     Fuses text + audio into a shared 256-dim embedding
+     Fuses text + image embeddings:
+       mean   → 512-dim
+       concat → 1024-dim
+       match  → 2048-dim  [t ; v ; |t-v| ; t⊙v]
      │
      ▼
-Stage 3 — VAE Compression (edge, optional)
-     Compresses the shared embedding for efficient transmission
+Stage 3 — Compression (edge, optional)
+     Compresses the fused embedding (typically to 64-dim) for transmission.
+     Seven methods, spanning closed-form and learned, label-free and
+     label-supervised:
+       PCA, LDA          — closed-form, no gradient training
+       BlockPCA          — closed-form, per-structural-block PCA (match fusion only)
+       AE, VAE           — learned, unsupervised (MSE / β-VAE reconstruction)
+       CrossModalAE      — learned, task-agnostic (InfoNCE on natural image-text pairing, no labels)
+       ContrastiveAE     — learned, task-aware (MSE + supervised contrastive loss on match labels)
      │
      ▼
 Stage 4 — Server-Side LLM Reasoning
-     Soft token injection → frozen LLM → task heads
-     Sentiment regression (MSE) + Emotion classification (BCE)
+     Soft-token injection → frozen LLM backbone → binary match head (BCE)
+     Backbone is swappable: GPT-2 (fast iteration) or a full MLLM
+     (LLaVA-1.5-7B, Qwen2-Audio-7B, Mistral-7B) — see "Server LLM Scenarios" below.
 ```
+
+Only the compression stage (when learned) and the server-side projection + match head are trained; the edge encoders and the server LLM backbone are frozen throughout.
 
 ## Dataset
 
-**CMU-MOSEI** via `cairocode/cmu_mosei_wav` (HuggingFace Hub)
+**MS-COCO** image-text matching, loaded via `emma/data/coco.py`. Streamed from Hugging Face `datasets`, split into non-overlapping train/valid/test windows.
 
-| Split | Samples |
-|-------|---------|
-| Train | 3,597   |
-| Valid | 742     |
-| Test  | 906     |
+Default splits: 5,000 / 500 / 500 (`--n-train --n-valid --n-test`). Headline paper results use the larger "72k" split: 72,000 / 5,000 / 5,000.
 
-Labels: continuous sentiment score + 6 emotion scores (happy, sad, anger, surprise, disgust, fear)
+## Results (server: GPT-2, 64-dim compression, 256B payload = 32× reduction)
 
-## Results (no compression, CPU, GPT-2 server)
+| Method | Supervision | CLIP + match fusion | MobileCLIP + match fusion |
+|---|---|---|---|
+| None (uncompressed, 2048-dim) | — | 97.92% | 98.41% |
+| PCA-64 | none | 96.88% | 57.35% |
+| AE-64 | none | 93.40% | 52.01% |
+| VAE-64 | none | 96.75% | 69.87% |
+| BlockPCA-64 | none | 97.12% | 97.85% |
+| LDA-64 | labels | 97.78% | 98.33% |
+| CrossModalAE-64 (task-agnostic) | pairs only | 94.09% | 90.30% |
+| ContrastiveAE-64 (task-aware) | labels | 98.08% | 98.32% |
 
-| Metric | Value |
-|--------|-------|
-| Sentiment MAE | 0.668 |
-| Sentiment Accuracy | 55.5% |
-| Emotion Accuracy | 83.1% |
-| Edge latency (median) | 921ms |
-| Server latency (median) | 57ms |
-| Total latency (median) | 986ms |
+MobileCLIP embeddings have higher intrinsic dimensionality than CLIP's, which is why generic compressors (PCA/AE/VAE) collapse on MobileCLIP but not CLIP — structure-aware methods (LDA, BlockPCA, ContrastiveAE) are robust to this because they exploit task- or block-level structure rather than raw variance alone.
+
+## Extension: full-MLLM server backbone
+
+`train_llava.py` swaps GPT-2 for LLaVA-1.5-7B's `language_model` backbone (vision tower discarded, EMMI's own soft tokens injected instead), reusing an already-trained compressor checkpoint rather than retraining it. Most (compressor, encoder) combinations match their GPT-2 accuracy within a few points; a subset (some AE/LDA/VAE/PCA cells on MobileCLIP+match) hit a numerical instability during LLaVA training that's under active investigation — see `slurm/test_llava_*.sh` for the diagnostic scripts.
 
 ## Project Structure
 
 ```
 /workspace/
 │
-├── train.py              # Main training script (all stages)
-├── benchmark.py          # Latency + task metrics evaluation
-├── Dockerfile            # Container definition
+├── train.py                  # Main training script: edge encode → compression → server (GPT-2 backbone)
+├── train_llava.py            # Server training against a full MLLM backbone (loads a pretrained compressor)
+├── benchmark.py               # Task metrics evaluation
+├── benchmark_latency.py       # Per-stage latency benchmark (encoders, fusion, compression, server GPT-2/LLaVA)
+├── benchmark_llava.py         # End-to-end LLaVA-NeXT latency benchmark
+├── check_llava_capability.py  # Smoke test: does the LLaVA backbone load and run a forward pass
+├── check_ckpts.py             # List validation accuracy across saved checkpoints
+├── eval_batch.py / eval_paper.py / eval_quantization.py / eval_test.py   # Test-set evaluation scripts
+├── precache_coco.py           # Pre-build the COCO embedding cache
+├── Dockerfile
 │
-├── emma/                 # Core library
-│   ├── config.py         # All hyperparameters as dataclasses
-│   │
-│   ├── encoders/         # Stage 1 — per-modality encoders
-│   │   ├── text_encoder.py       DistilBERT + projection head
-│   │   ├── audio_encoder.py      Whisper-small + projection head
-│   │   ├── vision_encoder.py     MobileNetV3 (reserved for future vision)
-│   │   └── feature_projector.py  Linear projector for pre-extracted features
-│   │
-│   ├── alignment/        # Stage 2 — cross-modal fusion
-│   │   └── cross_modal.py        Projects modalities to shared 256-dim space
-│   │
-│   ├── compression/      # Stage 3 — VAE (architecture ready, training TBD)
-│   │   └── vae.py                Beta-VAE encoder/decoder
-│   │
-│   ├── data/             # Dataset
-│   │   └── mosei.py              CMU-MOSEI loader (HuggingFace + mmsdk)
-│   │
-│   ├── server/           # Stage 4 — server-side LLM
-│   │   └── pipeline.py           Soft token injection + multi-task heads
-│   │
-│   └── pipeline.py       # EdgePipeline — wires all edge stages together
+├── emma/                      # Core library
+│   ├── config.py                     All hyperparameters as dataclasses
+│   ├── encoders/                     Stage 1 — per-modality encoders
+│   │   ├── text_encoder.py             CLIP text encoder
+│   │   ├── image_encoder.py            CLIP image encoder
+│   │   └── mobileclip_encoder.py       MobileCLIP2-S0 text + image encoders (open_clip)
+│   ├── alignment/
+│   │   └── cross_modal.py            Stage 2 — mean / concat / match fusion
+│   ├── compression/                  Stage 3 — compression methods
+│   │   ├── vae.py                      β-VAE
+│   │   ├── autoencoder.py              AE, ContrastiveAE (SupCon), CrossModalAE (InfoNCE)
+│   │   ├── pca.py                      Closed-form PCA
+│   │   ├── lda.py                      LDA-PCA hybrid (task-aware, closed-form)
+│   │   └── block_pca.py                Per-structural-block PCA (match fusion only)
+│   ├── data/
+│   │   └── coco.py                   MS-COCO image-text matching loader
+│   ├── server/
+│   │   └── pipeline.py               Stage 4 — soft-token injection + binary match head;
+│   │                                   GPT-2 / LLaVA / Qwen2-Audio / Mistral backbones
+│   └── pipeline.py                   EdgePipeline — wires the frozen edge stages together
 │
-├── checkpoints/          # Saved model weights (not in git)
-│   ├── best_edge.pt              Best edge stage checkpoint
-│   ├── best_server.pt            Best server stage checkpoint
-│   └── embed_cache/              Cached fused embeddings
-│
-└── mmsdk_cache/          # Visual feature cache (CMU-MOSEI Facet 4.2)
+├── paper/                     # Paper figures
+├── slurm/                     # Cluster job scripts: training sweeps, latency benchmarks, evaluation, diagnostics
+├── checkpoints/                # Saved model weights + embedding caches (not in git)
+└── submission.tex, related_work.tex, references.bib, ...   # Paper source
 ```
 
 ## Training
 
 ```bash
-python3 train.py
+python3 train.py \
+    --compression contrastiveae \
+    --encoder mobileclip \
+    --fusion match \
+    --n-train 72000 --n-valid 5000 --n-test 5000
 ```
 
 Two stages:
-1. **Edge** — trains projection heads + alignment jointly (10 epochs)
-2. **Server** — trains server projection + task heads on cached embeddings (10 epochs)
+1. **Compression** — skipped for `--compression none`; closed-form fit for `pca`/`lda`/`blockpca`; up to 50 epochs of gradient training for `ae`/`vae`/`contrastiveae`/`crossmodalae`.
+2. **Server** — 20 epochs by default (`--epochs`), early stopping (patience 10 by default, `--patience`), training only the projection MLP + match head against a frozen LLM.
 
-Resumes automatically from checkpoint if `checkpoints/best_edge.pt` exists.
+Use `--no-debug` to use a full LLM instead of GPT-2 — note that `train.py` hardcodes this to the `plain_llm` scenario (Mistral-7B) with no CLI flag to pick a different one; use `train_llava.py` for the `llava` scenario specifically (see below).
+
+For a full MLLM backbone specifically, use `train_llava.py` instead — it reuses an already-trained compressor checkpoint rather than retraining it:
+
+```bash
+python3 train_llava.py --compression contrastiveae --encoder mobileclip --load-in-8bit
+```
 
 ## Benchmark
 
 ```bash
-python3 benchmark.py
+python3 benchmark_latency.py
 ```
 
-Reports task metrics (MAE, accuracy) and latency (median, p95) broken down by edge vs server.
+Reports per-stage latency: encoder forward pass, fusion, compression encode, server inference (GPT-2 and LLaVA, GPU), and transmission latency across several bandwidth profiles.
 
 ## Setup
 
@@ -118,12 +149,12 @@ docker run -it --rm -v $(pwd):/workspace emma
 
 ## Server LLM Scenarios
 
-Three ablation scenarios configured via `ServerConfig.scenario`:
+Configured via `ServerConfig.scenario`:
 
 | Scenario | Model | Description |
 |----------|-------|-------------|
-| `plain_llm` | Mistral-7B | Text-only baseline |
+| `plain_llm` | Mistral-7B | Text-only baseline, no multimodal pre-training |
 | `llava` | LLaVA-1.5-7B | LLM pre-trained on visual soft tokens |
 | `qwen_audio` | Qwen2-Audio-7B | LLM pre-trained on audio soft tokens |
 
-Set `DEBUG=True` in `train.py` to use GPT-2 instead (no GPU needed).
+Set `DEBUG=True` in `train.py` (or omit `--no-debug`, its default) to use GPT-2 instead (fast, no GPU required). `train.py --no-debug` only exercises `plain_llm`; `qwen_audio` is registered but untested/unused in the current COCO pipeline (a holdover from an earlier audio-inclusive design). For `llava`, use `train_llava.py` — it also supports loading the backbone in 8-bit (`--load-in-8bit`) or fp32 (`--llm-dtype float32`) for memory-constrained GPUs.
