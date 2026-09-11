@@ -1,0 +1,236 @@
+\section{Experiments}
+
+\subsection{Setup}
+
+We evaluate EMMA on the COCO image-text matching task~\cite{lin2014microsoft} using binary classification (matched vs. mismatched pairs). Our main experiments use 80{,}000 training images (160{,}000 pairs), 500 validation images, and 500 test images; a data-scale ablation with 5{,}000 training images is reported in Section~\ref{sec:datascale}. The splits are non-overlapping windows into the dataset stream (validation and test follow immediately after the training window). Both modalities are encoded with frozen CLIP ViT-B/32~\cite{radford2021learning}, which projects text and image inputs into a shared 512-dimensional embedding space. The fused representation is obtained by mean-pooling the two modality embeddings.
+
+The server-side reasoning module consists of a trainable projection MLP that maps the received embedding into 8 soft prompt tokens, which are prepended to a frozen GPT-2~\cite{radford2019language} backbone. A binary classification head is trained on top of the final hidden state. All server-side training uses the Adam optimizer with a cosine annealing schedule, batch size 64, and learning rate $10^{-4}$ for 30 epochs. We use batch size 64; preliminary experiments showed batch size 256 caused server-side overfitting (80.2\% vs.\ 89.2\% test accuracy), consistent with known small-batch regularization effects~\cite{keskar2017large} (see Appendix~\ref{app:batchsize}).
+
+\subsection{Compression Methods}
+
+We evaluate six transmission configurations:
+
+\textbf{No compression.} The full 512-dimensional fused CLIP embedding is transmitted to the server (2\,KB per sample).
+
+\textbf{AutoEncoder (AE).} A plain autoencoder with hidden dimensions $(512 \to 512 \to 256 \to 128 \to 64)$ is trained with MSE reconstruction loss for 50 epochs. Only the 64-dimensional bottleneck vector (256\,B) is transmitted to the server. The server projection MLP is trained directly on these 64-dimensional latents; no decoder is needed at inference.
+
+\textbf{Variational AutoEncoder (VAE).} A $\beta$-VAE with the same architecture, trained with MSE reconstruction loss plus a KL divergence term. To prevent posterior collapse under the 8$\times$ compression ratio, we apply $\beta$ warmup (linearly increasing from 0 to $\beta{=}1$ over 20 epochs) and a free-bits constraint (minimum 0.5 nats per latent dimension). Only the mean vector $\mu \in \mathbb{R}^{64}$ (256\,B) is transmitted at inference; no decoder runs at inference.
+
+\textbf{PCA.} A linear projection onto the top-$k$ principal components of the training fused embeddings, computed via SVD. No gradient training is required — PCA is fitted analytically in a single pass. The $k$-dimensional projection (e.g.\ $k{=}64$, 256\,B) is transmitted to the server. PCA serves as a strong linear baseline: it maximally preserves the variance of the original CLIP embedding space, acting as a noise filter that retains the most informative directions.
+
+\textbf{DistilAE.} An autoencoder trained with an additional \emph{similarity distillation} loss that encourages the compressed latent space to preserve the pairwise cosine similarity structure of the original 512-dimensional CLIP embeddings:
+\begin{equation}
+    \mathcal{L}_{\text{DistilAE}} = \mathcal{L}_{\text{MSE}} + \lambda_{\text{distil}} \cdot \left\| S^{\text{latent}} - S^{\text{CLIP}} \right\|_F^2
+\end{equation}
+where $S^{\text{CLIP}}_{ij} = \cos(e_i, e_j)$ and $S^{\text{latent}}_{ij} = \cos(z_i, z_j)$ are the pairwise cosine similarity matrices of the original embeddings and latents respectively, computed over each training batch. No pair labels are required — the supervision signal comes entirely from CLIP's learned similarity geometry. We use $\lambda_{\text{distil}} = 0.1$.
+
+\textbf{DistilVarAE.} Extends DistilAE with an additional variance maximization term:
+\begin{equation}
+    \mathcal{L}_{\text{DistilVarAE}} = \mathcal{L}_{\text{MSE}} + \lambda_{\text{distil}} \cdot \left\| S^{\text{latent}} - S^{\text{CLIP}} \right\|_F^2 - \lambda_{\text{var}} \cdot \text{Var}(\mathbf{z})
+\end{equation}
+This encourages the latent dimensions to be spread out (high variance), preventing representational collapse. We use $\lambda_{\text{distil}} = 0.1$, $\lambda_{\text{var}} = 0.001$.
+
+All compression methods are trained in a \emph{decoupled} fashion: the compressor is trained independently of the server, and the server projection MLP is subsequently trained on the cached compressed latents. This design ensures modularity — the server LLM can be upgraded without retraining the edge compressor, and the edge compressor can be deployed independently of the server.
+
+\subsection{Results}
+
+\begin{table}[h]
+\centering
+\caption{COCO image-text matching results with 80{,}000 training images on NVIDIA A40 GPU (batch size 64). All compression methods transmit a $k$-dimensional float32 vector ($4k$ bytes). PCA is fitted analytically; AE/VAE/DistilAE train for 50 epochs; server trains for 30 epochs in all cases. 64-dim configurations report mean $\pm$ std over 5 random seeds; 128- and 32-dim configurations are single runs.}
+\label{tab:results}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Dims ($k$)} & \textbf{Payload} & \textbf{BW Reduction} & \textbf{Test Accuracy} \\
+\midrule
+Random baseline  & —   & —      & —          & 50.0\% \\
+No compression   & 512 & 2\,KB  & 1$\times$  & 95.1 $\pm$ 1.05\% \\
+\midrule
+PCA              & 128 & 512\,B & 4$\times$  & 95.7\% \\
+PCA              & 64  & 256\,B & 8$\times$  & 94.8 $\pm$ 0.24\% \\
+PCA              & 32  & 128\,B & 16$\times$ & 92.2\% \\
+\midrule
+AE               & 128 & 512\,B & 4$\times$  & 95.5\% \\
+AE               & 64  & 256\,B & 8$\times$  & 95.2 $\pm$ 0.19\% \\
+AE               & 32  & 128\,B & 16$\times$ & 95.2\% \\
+\midrule
+VAE              & 128 & 512\,B & 4$\times$  & 95.4\% \\
+VAE              & 64  & 256\,B & 8$\times$  & 94.6 $\pm$ 0.40\% \\
+VAE              & 32  & 128\,B & 16$\times$ & 94.2\% \\
+\midrule
+DistilAE         & 128 & 512\,B & 4$\times$  & 95.8\% \\
+DistilAE         & 64  & 256\,B & 8$\times$  & \textbf{95.4 $\pm$ 0.56\%} \\
+DistilAE         & 32  & 128\,B & 16$\times$ & 94.2\% \\
+DistilVarAE      & 64  & 256\,B & 8$\times$  & 65.1\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:results} summarises all compression methods across three bottleneck sizes. Several findings stand out.
+
+\textbf{8$\times$ compression is free.} At 64 dims, every compression method except VAE is statistically indistinguishable from transmitting the full 512-dimensional embedding (95.1 $\pm$ 1.05\%). DistilAE attains the highest mean accuracy (95.4 $\pm$ 0.56\%), followed by AE (95.2 $\pm$ 0.19\%); the difference between the two is within seed noise (5 seeds, $p \approx 0.35$). The practical conclusion is that the payload can be reduced from 2\,KB to 256\,B at no measurable accuracy cost.
+
+\textbf{Compression stabilises server training.} The no-compression baseline exhibits 2--5$\times$ higher variance across seeds ($\pm$1.05\,pp) than any compressed variant (AE $\pm$0.19, PCA $\pm$0.24, VAE $\pm$0.40, DistilAE $\pm$0.56). The bottleneck removes noise directions in the CLIP embedding space that the server-side classifier would otherwise fit inconsistently across initialisations, acting as an architectural regulariser.
+
+\textbf{Learned compression degrades more gracefully than PCA.} As the bottleneck tightens from 128 to 32 dims, PCA drops 3.5\,pp (95.7\% $\to$ 92.2\%) while AE remains essentially flat (95.5\% $\to$ 95.2\%). A linear projection is limited to the top-$k$ variance directions, whereas a learned encoder can pack task-relevant information non-linearly into fewer dimensions.
+
+\textbf{VAE consistently trails deterministic compression.} VAE records the lowest mean (94.6 $\pm$ 0.40\%) among learned methods. The KL term imposes an information budget on the latent beyond the dimensionality constraint, and the reparameterisation noise smooths the latent space — both properties benefit generative use cases that our discriminative pipeline never exercises. VAE regularisation and training data act as substitutes: the KL term helped in the low-data regime (Section~\ref{sec:datascale}) but only costs information once data is plentiful.
+
+\textbf{DistilVarAE is unstable at scale.} With the variance coefficient $\lambda_{\text{var}}=0.001$ that worked at small scale, DistilVarAE collapses to 65.1\% at 80K training samples, indicating the variance maximization term destabilises training as dataset size grows. Since it offers no benefit over DistilAE, we exclude it from further analysis.
+
+\subsection{Data-Scale Ablation}
+\label{sec:datascale}
+
+\begin{table}[h]
+\centering
+\caption{Effect of training-set size on test accuracy (64-dim bottleneck, 8$\times$ compression). The 5K and 80K settings use different (non-overlapping) test windows of 500 images each.}
+\label{tab:datascale}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{5K train} & \textbf{80K train} & \textbf{$\Delta$} \\
+\midrule
+No compression & 89.2\% & 95.1\% & +5.9\,pp \\
+PCA            & 91.9\% & 94.8\% & +2.9\,pp \\
+AE             & 84.7\% & 95.2\% & +10.5\,pp \\
+VAE            & 84.9\% & 94.6\% & +9.7\,pp \\
+DistilAE       & 87.9\% & 95.4\% & +7.5\,pp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:datascale} compares the 64-dim configurations trained on 5{,}000 vs.\ 80{,}000 images (80K values are 5-seed means; 5K values are single runs). The ranking of methods inverts with scale. In the low-data regime, PCA is the strongest method (91.9\%) and all learned compressors underperform it — an analytically fitted linear projection cannot overfit, while learned encoders lack sufficient training signal. With 16$\times$ more data, the learned methods gain 7--10\,pp and match or overtake PCA, whose accuracy is intrinsically capped by its linearity (+2.9\,pp only). This has a practical implication for edge deployment: PCA is the right choice when task data is scarce (it is also free to fit), while learned compression is preferable once sufficient unlabelled data is available — the DistilAE distillation loss requires no pair labels.
+
+\subsection{System Design Rationale}
+
+Per-sample transmission savings (1.64\,ms $\to$ 0.21\,ms at LTE) are modest relative to the edge encoding cost ($\sim$86\,ms on mobile). The value of embedding compression is therefore not primarily per-sample latency reduction. Instead, the design addresses the following practical deployment concerns:
+
+\begin{itemize}
+    \item \textbf{Aggregate bandwidth at scale.} A single device sending 2\,KB vs.\ 256\,B per inference is negligible. With 1{,}000 concurrent edge devices, uncompressed transmission requires 2\,MB per inference cycle; 8$\times$ compression reduces this to 256\,KB — the difference between feasible and infeasible deployment on shared wireless infrastructure.
+
+    \item \textbf{Privacy preservation.} The server receives a 64-dimensional abstract latent, never the raw image or text. Sensitive content (medical images, personal conversations) never leaves the edge device in recoverable form, which is critical for healthcare, surveillance, and enterprise deployments.
+
+    \item \textbf{One server, many clients.} The frozen server LLM handles many edge devices simultaneously via task-specific projection MLPs ($\sim$100K parameters each). Compression reduces per-client bandwidth, making this many-to-one architecture practical at scale without upgrading network infrastructure.
+
+    \item \textbf{Offloading heavy reasoning.} Edge encoders are the true bottleneck ($\sim$86\,ms on mobile). The split design runs a lightweight encoder on the edge and offloads complex reasoning to the server — compression keeps the uplink cost low so this offloading remains practical even on constrained networks.
+\end{itemize}
+
+\subsection{Latency Analysis}
+
+Table~\ref{tab:latency} breaks down the per-stage inference latency measured on an NVIDIA A40 GPU (median over 200 runs, single sample). The CLIP encoders dominate edge processing at $\sim$10.7\,ms when run sequentially. The compression encoder adds only 0.16--0.19\,ms overhead, which is negligible. Transmission savings are significant on constrained networks: compressing 8$\times$ reduces LTE transmission time from 1.64\,ms to 0.21\,ms. The server projection MLP and GPT-2 forward pass together account for $\sim$7.1\,ms.
+
+\begin{table}[h]
+\centering
+\caption{Per-stage inference latency on NVIDIA A40 GPU (median over 200 runs, single sample). TX = estimated transmission time at uplink speed. Sequential encoder timing shown; parallel encoding results in Table~\ref{tab:latency_parallel}.}
+\label{tab:latency}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Stage} & \textbf{Location} & \textbf{No Compress} & \textbf{AE} & \textbf{VAE} \\
+\midrule
+CLIP text encoder   & Edge    & 5.96\,ms & 5.93\,ms & 5.97\,ms \\
+CLIP image encoder  & Edge    & 4.74\,ms & 4.72\,ms & 4.76\,ms \\
+Mean fusion         & Edge    & 0.04\,ms & 0.04\,ms & 0.04\,ms \\
+Compression encoder & Edge    & —        & 0.16\,ms & 0.19\,ms \\
+\midrule
+TX @ LTE (10\,Mbps) & Network & 1.64\,ms & 0.21\,ms & 0.21\,ms \\
+TX @ WiFi (50\,Mbps)& Network & 0.33\,ms & 0.04\,ms & 0.04\,ms \\
+TX @ 5G (100\,Mbps) & Network & 0.16\,ms & 0.02\,ms & 0.02\,ms \\
+\midrule
+Projection MLP      & Server  & 0.12\,ms & 0.10\,ms & 0.10\,ms \\
+GPT-2               & Server  & 6.98\,ms & 6.96\,ms & 6.99\,ms \\
+Match head          & Server  & 0.07\,ms & 0.07\,ms & 0.07\,ms \\
+\midrule
+\textbf{Edge total (sequential)} & & \textbf{10.74\,ms} & \textbf{10.85\,ms} & \textbf{10.97\,ms} \\
+\textbf{Server total}            & & \textbf{7.17\,ms}  & \textbf{7.13\,ms}  & \textbf{7.16\,ms}  \\
+\textbf{E2E @ WiFi}              & & \textbf{18.2\,ms}  & \textbf{18.0\,ms}  & \textbf{18.2\,ms}  \\
+\textbf{E2E @ LTE}               & & \textbf{19.5\,ms}  & \textbf{18.2\,ms}  & \textbf{18.3\,ms}  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On capable edge platforms (multi-core SBCs, Jetson, smartphones), the text and image encoders can run in parallel on separate processing elements. On the A40 GPU, CUDA stream parallelism yields $\sim$11.4\,ms — marginally slower than sequential due to resource contention on a monolithic GPU; full per-stage parallel timings are reported in Appendix~\ref{app:parallel}.
+
+\textbf{Estimated latency on a real edge device.} The A40 measurements above do not reflect real edge hardware. Table~\ref{tab:latency_mobile} provides estimated per-stage latency for an iPhone~12 Pro Max, the only device for which a citable CLIP ViT-B/32 latency exists in the literature. The CLIP image encoder time (38\,ms) is taken directly from Vasu et al.~\cite{vasu2024mobileclip}, who measure CoreML inference on iPhone~12 Pro Max. The text encoder time is estimated by scaling with the A40 text/image ratio (5.96\,ms\,/\,4.74\,ms\,$= 1.26\times$), giving $\sim$48\,ms; this extrapolation assumes the same relative cost holds on mobile, which may not be exact. The compression encoder consists solely of linear projections ($<$1\,M FLOPs); at mobile CPU throughput its contribution is $<$1\,ms and treated as negligible. Transmission and server times are identical to Table~\ref{tab:latency} as they are hardware-independent.
+
+\begin{table}[h]
+\centering
+\caption{Estimated per-stage latency on iPhone~12 Pro Max (CoreML). $\dagger$~=~measured~\cite{vasu2024mobileclip}; $\ddagger$~=~estimated by scaling A40 text/image ratio; $*$~=~estimated negligible ($<$1\,ms, linear layers only). TX and server times are identical to Table~\ref{tab:latency}.}
+\label{tab:latency_mobile}
+\begin{tabular}{llcc}
+\toprule
+\textbf{Stage} & \textbf{Location} & \textbf{No Compress} & \textbf{AE (64-dim)} \\
+\midrule
+CLIP image encoder  & Edge    & 38\,ms$^\dagger$  & 38\,ms$^\dagger$ \\
+CLIP text encoder   & Edge    & $\sim$48\,ms$^\ddagger$ & $\sim$48\,ms$^\ddagger$ \\
+Mean fusion         & Edge    & $<$1\,ms$^*$      & $<$1\,ms$^*$ \\
+Compression encoder & Edge    & —                 & $<$1\,ms$^*$ \\
+\midrule
+TX @ LTE (10\,Mbps) & Network & 1.64\,ms          & 0.21\,ms \\
+TX @ WiFi (50\,Mbps)& Network & 0.33\,ms          & 0.04\,ms \\
+\midrule
+Projection MLP      & Server  & 0.12\,ms          & 0.10\,ms \\
+GPT-2               & Server  & 6.98\,ms          & 6.96\,ms \\
+Match head          & Server  & 0.07\,ms          & 0.07\,ms \\
+\midrule
+\textbf{Edge total}  & & $\sim$\textbf{86\,ms} & $\sim$\textbf{87\,ms} \\
+\textbf{E2E @ WiFi}  & & $\sim$\textbf{94\,ms} & $\sim$\textbf{94\,ms} \\
+\textbf{E2E @ LTE}   & & $\sim$\textbf{95\,ms} & $\sim$\textbf{94\,ms} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two findings carry over from GPU to mobile: (1)~the compression encoder overhead remains negligible regardless of hardware, since it contains no attention operations; (2)~the transmission savings from 8$\times$ compression (1.64\,ms $\to$ 0.21\,ms at LTE) are hardware-independent and become relatively more significant as edge encoding dominates total latency. Full mobile benchmarking across compression methods is left for future work.
+
+All results use frozen CLIP encoders and a debug-scale GPT-2 server. Future work will evaluate with a larger server-side MLLM (e.g.\ LLaVA, Flamingo) where the soft-prompt interface is expected to yield larger gains over direct classification.
+
+\appendix
+
+\section{Parallel CLIP Encoding Latency}
+\label{app:parallel}
+
+Table~\ref{tab:latency_parallel} reports per-stage latency when both CLIP encoders run concurrently via CUDA streams on the A40. Parallel execution yields $\sim$11.4\,ms edge time — marginally slower than sequential ($\sim$10.7\,ms) because both encoder kernels compete for the same compute units, L2 cache, and memory bandwidth on a monolithic GPU. Parallel encoding is beneficial on heterogeneous hardware (Jetson CPU+GPU, smartphone CPU+NPU) where both encoders run on separate processing elements with no resource contention.
+
+\begin{table}[h]
+\centering
+\caption{Per-stage inference latency with parallel CLIP encoding on NVIDIA A40 GPU (median over 200 runs).}
+\label{tab:latency_parallel}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Stage} & \textbf{Location} & \textbf{No Compress} & \textbf{AE} & \textbf{VAE} \\
+\midrule
+CLIP encoders (parallel) & Edge    & 11.40\,ms & 11.32\,ms & 11.36\,ms \\
+Mean fusion              & Edge    & 0.04\,ms  & 0.04\,ms  & 0.04\,ms  \\
+Compression encoder      & Edge    & —         & 0.16\,ms  & 0.19\,ms  \\
+\midrule
+TX @ LTE (10\,Mbps)      & Network & 1.64\,ms  & 0.21\,ms  & 0.21\,ms  \\
+TX @ WiFi (50\,Mbps)     & Network & 0.33\,ms  & 0.04\,ms  & 0.04\,ms  \\
+TX @ 5G (100\,Mbps)      & Network & 0.16\,ms  & 0.02\,ms  & 0.02\,ms  \\
+\midrule
+Projection MLP           & Server  & 0.12\,ms  & 0.10\,ms  & 0.10\,ms  \\
+GPT-2                    & Server  & 6.98\,ms  & 6.96\,ms  & 6.99\,ms  \\
+Match head               & Server  & 0.07\,ms  & 0.07\,ms  & 0.07\,ms  \\
+\midrule
+\textbf{Edge total (parallel)} & & \textbf{11.44\,ms} & \textbf{11.52\,ms} & \textbf{11.59\,ms} \\
+\textbf{Server total}          & & \textbf{7.17\,ms}  & \textbf{7.13\,ms}  & \textbf{7.16\,ms}  \\
+\textbf{E2E @ WiFi}            & & \textbf{18.9\,ms}  & \textbf{18.7\,ms}  & \textbf{18.8\,ms}  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Effect of Batch Size on Server Training}
+\label{app:batchsize}
+
+Table~\ref{tab:batchsize} shows the effect of training batch size on server-side accuracy. With batch size 256, the no-compression model overfits severely (train accuracy 98.4\% vs.\ test 80.2\%), while compressed variants are less affected due to the implicit regularisation of the bottleneck. Reducing batch size to 64 introduces more gradient noise, acting as a regulariser and recovering 9\,pp of accuracy for the no-compression baseline.
+
+\begin{table}[h]
+\centering
+\caption{Effect of batch size on test accuracy (64-dim compression). Larger batches cause overfitting in the no-compression setting.}
+\label{tab:batchsize}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Batch 256} & \textbf{Batch 64} & \textbf{$\Delta$} \\
+\midrule
+No compression & 80.2\% & 89.2\% & +9.0 pp \\
+AE             & 77.4\% & 84.7\% & +7.3 pp \\
+VAE            & 74.6\% & 84.9\% & +10.3 pp \\
+\bottomrule
+\end{tabular}
+\end{table}

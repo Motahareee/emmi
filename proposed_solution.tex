@@ -1,0 +1,57 @@
+\section{Proposed System}
+
+\subsection{Overview}
+
+EMMA (Edge Multimodal Model Adapter) is a split inference framework for multimodal AI on resource-constrained edge devices. Rather than running a full multimodal large language model (MLLM) on the device, EMMA divides inference into two stages: a lightweight \emph{edge stage} that encodes and compresses multimodal inputs, and a \emph{server stage} that performs high-level reasoning using a frozen LLM. Only a compact latent vector is transmitted over the network, reducing bandwidth requirements while keeping raw data on the device.
+
+Figure~\ref{fig:pipeline} illustrates the full pipeline. Data flows from the edge to the server in four steps: (1) modality encoding, (2) cross-modal fusion, (3) embedding compression, and (4) server-side reasoning via soft prompts.
+
+\subsection{Edge Stage}
+
+\textbf{Modality encoders.} Each input modality is encoded independently using a frozen pre-trained encoder. In our COCO evaluation we use CLIP ViT-B/32~\cite{radford2021learning} for both image and text, projecting each into a shared 512-dimensional embedding space. The encoders are frozen throughout — no fine-tuning is performed on the edge.
+
+\textbf{Cross-modal fusion.} The modality embeddings are fused into a single 512-dimensional vector by mean-pooling:
+\begin{equation}
+    e = \frac{1}{M} \sum_{m=1}^{M} e_m
+\end{equation}
+where $e_m \in \mathbb{R}^{512}$ is the embedding for modality $m$ and $M$ is the number of modalities. Mean-pooling adds no learnable parameters and negligible latency ($<$1\,ms), making it suitable for constrained edge hardware.
+
+\textbf{Embedding compression.} The fused embedding $e \in \mathbb{R}^{512}$ is compressed to a $k$-dimensional latent vector $z \in \mathbb{R}^{k}$ ($k \ll 512$) before transmission. We evaluate five compression strategies (Section~\ref{sec:compression}); only $z$ is transmitted to the server, reducing the payload from 2\,KB to $4k$\,bytes.
+
+\subsection{Compression Methods}
+\label{sec:compression}
+
+We evaluate five compression strategies, ranging from analytical to learned:
+
+\textbf{PCA.} A linear projection onto the top-$k$ principal components of the training embeddings, fitted analytically via SVD. No gradient training is required.
+
+\textbf{AutoEncoder (AE).} A plain autoencoder with encoder architecture $512 \to 512 \to 256 \to 128 \to k$, trained with MSE reconstruction loss. Only the encoder runs on the edge at inference; no decoder is needed at the server.
+
+\textbf{Variational AutoEncoder (VAE).} A $\beta$-VAE with the same architecture, adding a KL divergence regularisation term. Only the mean vector $\mu \in \mathbb{R}^{k}$ is transmitted at inference. We apply $\beta$ warmup and a free-bits constraint to prevent posterior collapse.
+
+\textbf{DistilAE.} Our proposed method. We augment the AE reconstruction loss with a \emph{relational distillation} term~\cite{park2019relational} that encourages the compressed latent space to preserve the pairwise cosine similarity structure of the original CLIP embeddings:
+\begin{equation}
+    \mathcal{L}_{\text{DistilAE}} = \mathcal{L}_{\text{MSE}} + \lambda_{\text{distil}} \cdot \left\| S^{\text{latent}} - S^{\text{CLIP}} \right\|_F^2
+\end{equation}
+where $S^{\text{CLIP}}_{ij} = \cos(e_i, e_j)$ and $S^{\text{latent}}_{ij} = \cos(z_i, z_j)$ are pairwise cosine similarity matrices computed over each training batch. Crucially, \emph{no task labels are required} — the supervision signal comes entirely from CLIP's pre-trained similarity geometry. This adapts the relational knowledge distillation objective of Park et al.~\cite{park2019relational} from model compression to the embedding transmission setting: rather than distilling from teacher to student model, we distill geometric structure from a high-dimensional embedding into a bandwidth-constrained latent vector.
+
+\textbf{DistilVarAE.} Extends DistilAE with a variance maximization term to prevent latent collapse, with an additional $-\lambda_{\text{var}} \cdot \text{Var}(\mathbf{z})$ penalty (Section~\ref{sec:results}).
+
+\subsection{Server Stage}
+
+The server hosts a single frozen LLM shared across all edge clients. Upon receiving the compressed latent $z \in \mathbb{R}^{k}$, a task-specific \emph{projection MLP} maps it into $N$ soft prompt tokens:
+\begin{equation}
+    P = \text{MLP}(z) \in \mathbb{R}^{N \times d_{\text{LLM}}}
+\end{equation}
+where $d_{\text{LLM}}$ is the LLM hidden dimension and $N{=}8$ in our experiments. These tokens are prepended to the frozen LLM's input sequence, conditioning its output on the edge's compressed multimodal representation. A lightweight binary classification head on the final hidden state produces the prediction.
+
+The projection MLP contains $\sim$100K parameters — orders of magnitude fewer than the LLM itself. A new edge device or task requires training only this small adapter, not the server LLM.
+
+\subsection{Decoupled Training}
+
+All compression methods are trained \emph{independently} of the server. The compressor is first trained on the fused CLIP embeddings; the resulting latents are cached and used to train the server projection MLP and classification head. This decoupling provides two practical benefits:
+
+\begin{itemize}
+    \item \textbf{Server upgradability.} The server LLM can be replaced (e.g.\ GPT-2 $\to$ LLaVA) without retraining the edge compressor.
+    \item \textbf{Edge independence.} The edge compressor can be deployed and updated independently of the server, supporting heterogeneous device fleets where different devices use different compression strategies or bottleneck sizes.
+\end{itemize}

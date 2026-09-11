@@ -1,0 +1,89 @@
+\section{RELATED WORK AND BACKGROUND}
+
+\subsection{Edge-Server Split Inference}
+
+Edge-server collaborative inference distributes computation across edge and server
+resources to avoid executing full MLLM pipelines on constrained devices. Prior work has
+demonstrated, however, that na\"{i}ve layer-wise splitting increases end-to-end latency
+by $2.35\times$ compared to server-only execution due to the per-token communication
+overhead inherent in autoregressive generation~\cite{park2025specedge}. Approaches such
+as EdgeShard~\cite{zhang2025edgeshard}, Splitwise~\cite{younesi2025splitwise}, and
+adaptive layer splitting~\cite{chen2025adaptivesplit} address this through collaborative
+layer partitioning and dynamic cut-point selection, reducing communication overhead while
+balancing computation across the edge-server boundary. However, these systems are designed
+exclusively for single-modality text pipelines and do not consider the additional challenge
+of encoding and aligning heterogeneous sensor streams before transmission.
+{\em EMMA addresses this gap by performing lightweight multimodal encoding and cross-modal
+alignment at the edge and transmitting a single fixed-size latent vector, avoiding
+per-token cross-boundary communication regardless of the number of input modalities.}
+
+\subsection{On-Device Optimization}
+
+A parallel line of work reduces MLLM resource requirements to enable on-device deployment.
+Dedicated accelerators such as NPUs, FPGAs, and NPU-PIM hybrids~\cite{p3llm,motoyama2024iedm}
+target the memory-bandwidth bottleneck of transformer inference through near-data compute,
+while activation-aware quantization methods such as AWQ~\cite{lin2024awq} enable 4-bit
+mixed-precision execution on commodity edge GPUs with negligible accuracy loss. Knowledge
+distillation approaches~\cite{yao2024gkt,yao2025efficient} offer a complementary route,
+producing compact edge-deployable MLLMs by transferring capability from large server-side
+models. Within single-device MLLM inference, visual token reduction methods further reduce
+computation: FastV~\cite{chen2024fastv} prunes visual tokens in deep transformer layers
+based on attention patterns, LLaVA-PruMerge~\cite{shang2024llavaprumerge} performs adaptive
+token selection at the feature projection stage, and VisionZip~\cite{yang2024visionzip}
+selects compact visual representations by identifying redundant tokens through encoder
+attention analysis. Despite these advances, the fundamental capacity gap between modern
+MLLMs and fully constrained edge platforms remains: processing a single image-text query
+with LLaVA-1.5 requires approximately 18.2 TFLOPs and 41.6 GB of memory, far exceeding
+the 1.3 TFLOPs and 8 GB available on platforms such as the NVIDIA Jetson TX2. Furthermore,
+as noted in~\cite{yuan2025task}, visual token reduction methods assume inference is executed
+on a single device and do not consider transmission constraints in edge-server pipelines.
+{\em On-device optimization alone cannot support full MLLM inference on the most constrained
+edge devices, motivating EMMA's approach of offloading reasoning to the server while keeping
+only lightweight encoding at the edge.}
+
+\subsection{Feature Compression and Offloading}
+
+A growing body of work applies task-oriented communication principles to reduce transmission
+overhead in edge inference pipelines, compressing features to retain only task-relevant
+information rather than optimizing for pixel-accurate reconstruction.
+
+He et al.~\cite{he2022elic} propose ELIC, an efficient learned image codec using
+space-channel contextual adaptive entropy coding. ELIC optimizes for pixel-accurate
+reconstruction and serves as a general-purpose image transmission baseline, but has no
+awareness of downstream task semantics — compression quality is measured in PSNR/MS-SSIM,
+not task accuracy.
+
+Yuan et al.~\cite{yuan2025task} propose a task-oriented feature compression (TOFC) method
+for large multimodal model inference in a device-edge co-inference framework. TOFC employs
+density-peaks clustering to merge visual features, reducing the number of transmitted visual
+tokens to only 1.1\%--4.4\% of the original count, and applies a learnable entropy model
+with hyperprior to further compress the merged features. Crucially, TOFC treats modalities
+independently: the textual instruction is transmitted raw to the server, and cross-modal
+alignment occurs entirely on the server side, meaning image compression at the edge is not
+informed by the user query. Furthermore, TOFC trains the compressor end-to-end with the
+downstream task model, requiring task labels and a fixed server model during compression
+training. MoA-Off~\cite{yang2025moaoff} introduces a lightweight modality-aware module that
+estimates the complexity of heterogeneous inputs and dynamically schedules which modalities
+are processed locally versus offloaded to the cloud, achieving over 30\% latency reduction
+and 30\%--65\% decrease in resource overhead. Semantic communication
+frameworks~\cite{ref19,ref20} transmit task-relevant representations rather than raw data,
+providing theoretical grounding for learned compact encodings at the edge, but are
+predominantly designed for single-modality streams and require end-to-end joint optimization
+of encoder and decoder.
+
+To compress the latent itself, we adapt the Relational Knowledge Distillation (RKD)
+objective of Park et al.~\cite{park2019relational}, which preserves pairwise structural
+relationships between samples rather than matching individual outputs. Rather than distilling
+from teacher to student model, EMMA distills geometric structure from a high-dimensional
+CLIP embedding into a bandwidth-constrained latent vector — the DistilAE loss — without
+requiring task labels.
+
+{\em EMMA differs from these works in three key respects. First, EMMA performs cross-modal
+alignment at the edge prior to compression, transmitting a single unified $k$-dimensional
+latent regardless of input complexity. Second, EMMA's compressor is trained without task
+labels — supervision comes entirely from the pre-trained CLIP embedding geometry via the
+DistilAE relational distillation loss — enabling the edge compressor to be deployed
+independently of any specific server task. Third, no decoder runs at inference: the
+compressed latent is mapped directly to soft prompt tokens via a lightweight projection MLP
+($\sim$100K parameters), eliminating server-side reconstruction overhead and allowing the
+frozen server LLM to be upgraded or replaced without retraining the edge components.}
