@@ -104,10 +104,10 @@ MobileCLIP embeddings have higher intrinsic dimensionality than CLIP's, which is
 │   │                                   GPT-2 / LLaVA / Qwen2-Audio / Mistral backbones
 │   └── pipeline.py                   EdgePipeline — wires the frozen edge stages together
 │
-├── paper/                     # Paper figures
+├── reports/                    # Paper source: submission.tex, related_work.tex, references.bib,
+│                                 proposed_solution.tex, results_draft.tex, figures, analysis scripts
 ├── slurm/                     # Cluster job scripts: training sweeps, latency benchmarks, evaluation, diagnostics
-├── checkpoints/                # Saved model weights + embedding caches (not in git)
-└── submission.tex, related_work.tex, references.bib, ...   # Paper source
+└── checkpoints/                # Saved model weights + embedding caches (not in git)
 ```
 
 ## Training
@@ -149,12 +149,11 @@ docker run -it --rm -v $(pwd):/workspace emma
 
 ## Server LLM Scenarios
 
-Configured via `ServerConfig.scenario`:
+| Backbone | Model | Status |
+|----------|-------|--------|
+| GPT-2 | `gpt2` | **Actively used** — produces every result in the paper's headline table (`DEBUG=True` in `train.py`, the default) |
+| `llava` | LLaVA-1.5-7B | **Actively used** — see "Extension: full-MLLM server backbone" above; run via `train_llava.py` |
+| `plain_llm` | Mistral-7B | Registered in `ServerConfig.scenario` but not yet run/validated in the COCO pipeline |
+| `qwen_audio` | Qwen2-Audio-7B-Instruct | Registered but unused — a holdover from an earlier audio-inclusive design, before the COCO pivot |
 
-| Scenario | Model | Description |
-|----------|-------|-------------|
-| `plain_llm` | Mistral-7B | Text-only baseline, no multimodal pre-training |
-| `llava` | LLaVA-1.5-7B | LLM pre-trained on visual soft tokens |
-| `qwen_audio` | Qwen2-Audio-7B | LLM pre-trained on audio soft tokens |
-
-Set `DEBUG=True` in `train.py` (or omit `--no-debug`, its default) to use GPT-2 instead (fast, no GPU required). `train.py --no-debug` only exercises `plain_llm`; `qwen_audio` is registered but untested/unused in the current COCO pipeline (a holdover from an earlier audio-inclusive design). For `llava`, use `train_llava.py` — it also supports loading the backbone in 8-bit (`--load-in-8bit`) or fp32 (`--llm-dtype float32`) for memory-constrained GPUs.
+`train.py --no-debug` only exercises `plain_llm` (no CLI flag selects a different scenario). For `llava`, use `train_llava.py` instead — it also supports loading the backbone in 8-bit (`--load-in-8bit`) or fp32 (`--llm-dtype float32`) for memory-constrained GPUs.
