@@ -1,6 +1,6 @@
 # EMMI
 
-**Paper:** [EMMI: Edge Multi-Modal Intelligence for Communication-Efficient MLLM Inference via Fused Representation Compression](https://arxiv.org/abs/2609.11058) — Motahare Mounesan, Irfan Khan
+**Paper:** [EMMI: Edge Multi-Modal Intelligence for Communication-Efficient MLLM Inference via Fused Representation Compression](https://arxiv.org/abs/2609.11058)
 
 EMMI is a lightweight multimodal AI inference pipeline for edge-server split deployment. It encodes and compresses multimodal inputs on-device, transmits a compact latent representation, and offloads reasoning to a server-side language model — optimizing for inference latency and communication payload while preserving task accuracy.
 
