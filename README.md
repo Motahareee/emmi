@@ -65,7 +65,7 @@ Default splits: 5,000 / 500 / 500 (`--n-train --n-valid --n-test`). Headline pap
 
 MobileCLIP embeddings have higher intrinsic dimensionality than CLIP's, which is why generic compressors (PCA/AE/VAE) collapse on MobileCLIP but not CLIP — structure-aware methods (LDA, BlockPCA, ContrastiveAE) are robust to this because they exploit task- or block-level structure rather than raw variance alone.
 
-## Extension: full-MLLM server backbone
+## Full-MLLM server backbone (LLaVA)
 
 `train_llava.py` swaps GPT-2 for LLaVA-1.5-7B's `language_model` backbone (vision tower discarded, EMMI's own soft tokens injected instead), reusing an already-trained compressor checkpoint rather than retraining it. Most (compressor, encoder) combinations match their GPT-2 accuracy within a few points; a subset (some AE/LDA/VAE/PCA cells on MobileCLIP+match) hit a numerical instability during LLaVA training that's under active investigation — see `slurm/test_llava_*.sh` for the diagnostic scripts.
 
@@ -154,6 +154,6 @@ docker run -it --rm -v $(pwd):/workspace emma
 | Backbone | Model | Notes |
 |----------|-------|-------|
 | GPT-2 | `gpt2` | Produces every result in the paper's headline table (`DEBUG=True` in `train.py`, the default) |
-| `llava` | LLaVA-1.5-7B | See "Extension: full-MLLM server backbone" above; run via `train_llava.py` |
+| `llava` | LLaVA-1.5-7B | See "Full-MLLM server backbone (LLaVA)" above; run via `train_llava.py` |
 
 `train.py --no-debug` does not support selecting `llava` via CLI — use `train_llava.py` instead, which also supports loading the backbone in 8-bit (`--load-in-8bit`) or fp32 (`--llm-dtype float32`) for memory-constrained GPUs.
