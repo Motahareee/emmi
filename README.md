@@ -50,24 +50,24 @@ Only the compression stage (when learned) and the server-side projection + match
 
 Default splits: 5,000 / 500 / 500 (`--n-train --n-valid --n-test`). Headline paper results use the larger "72k" split: 72,000 / 5,000 / 5,000.
 
-## Results (server: GPT-2, 64-dim compression, 256B payload = 32× reduction)
+## Results (64-dim compression, 256B payload = 32× reduction)
 
-| Method | Supervision | CLIP + match fusion | MobileCLIP + match fusion |
-|---|---|---|---|
-| None (uncompressed, 2048-dim) | — | 97.92% | 98.41% |
-| PCA-64 | none | 96.88% | 57.35% |
-| AE-64 | none | 93.40% | 52.01% |
-| VAE-64 | none | 96.75% | 69.87% |
-| BlockPCA-64 | none | 97.12% | 97.85% |
-| LDA-64 | labels | 97.78% | 98.33% |
-| CrossModalAE-64 (task-agnostic) | pairs only | 94.09% | 90.30% |
-| ContrastiveAE-64 (task-aware) | labels | 98.08% | 98.32% |
+| Method | Supervision | CLIP+match (GPT-2) | CLIP+match (LLaVA) | MobileCLIP+match (GPT-2) | MobileCLIP+match (LLaVA) |
+|---|---|---|---|---|---|
+| None (uncompressed, 2048-dim) | — | 97.92% | 96.70% | 98.41% | 97.91% |
+| PCA-64 | none | 96.88% | not run | 57.35% | unresolved instability† |
+| AE-64 | none | 93.40% | 84.22% | 52.01% | unresolved instability† |
+| VAE-64 | none | 96.75% | 95.75% | 69.87% | unresolved instability† |
+| BlockPCA-64 | none | 97.12% | 95.28% | 97.85% | 82.97% |
+| LDA-64 | labels | 97.78% | 93.72% | 98.33% | unresolved instability† |
+| CrossModalAE-64 (task-agnostic) | pairs only | 94.09% | 90.49% | 90.30% | 90.64% |
+| ContrastiveAE-64 (task-aware) | labels | 98.08% | unresolved instability† | 98.32% | 98.19% |
 
-MobileCLIP embeddings have higher intrinsic dimensionality than CLIP's, which is why generic compressors (PCA/AE/VAE) collapse on MobileCLIP but not CLIP — structure-aware methods (LDA, BlockPCA, ContrastiveAE) are robust to this because they exploit task- or block-level structure rather than raw variance alone.
+MobileCLIP embeddings have higher intrinsic dimensionality than CLIP's, which is why generic compressors (PCA/AE/VAE) collapse on MobileCLIP but not CLIP under GPT-2 — structure-aware methods (LDA, BlockPCA, ContrastiveAE) are robust to this because they exploit task- or block-level structure rather than raw variance alone.
 
-## Full-MLLM server backbone (LLaVA)
+`train_llava.py` runs the LLaVA-1.5-7B `language_model` backbone (vision tower discarded, EMMI's own soft tokens injected instead) in place of GPT-2, reusing an already-trained compressor checkpoint rather than retraining it — see `--load-in-8bit` / `--llm-dtype float32` above for memory-constrained GPUs.
 
-`train_llava.py` swaps GPT-2 for LLaVA-1.5-7B's `language_model` backbone (vision tower discarded, EMMI's own soft tokens injected instead), reusing an already-trained compressor checkpoint rather than retraining it. Most (compressor, encoder) combinations match their GPT-2 accuracy within a few points; a subset (some AE/LDA/VAE/PCA cells on MobileCLIP+match) hit a numerical instability during LLaVA training that's under active investigation — see `slurm/test_llava_*.sh` for the diagnostic scripts.
+**† Unresolved instability:** these cells never actually trained — gradients go non-finite on nearly every batch and the model stays at its random initialization (~50% accuracy). Confirmed independent of the projection's random seed and of precision (both 8-bit and genuine fp32 fail identically); root cause is still under investigation. See `slurm/test_llava_*.sh` for the diagnostic scripts.
 
 ## Project Structure
 
@@ -154,6 +154,6 @@ docker run -it --rm -v $(pwd):/workspace emma
 | Backbone | Model | Notes |
 |----------|-------|-------|
 | GPT-2 | `gpt2` | Produces every result in the paper's headline table (`DEBUG=True` in `train.py`, the default) |
-| `llava` | LLaVA-1.5-7B | See "Full-MLLM server backbone (LLaVA)" above; run via `train_llava.py` |
+| `llava` | LLaVA-1.5-7B | See Results above; run via `train_llava.py` |
 
 `train.py --no-debug` does not support selecting `llava` via CLI — use `train_llava.py` instead, which also supports loading the backbone in 8-bit (`--load-in-8bit`) or fp32 (`--llm-dtype float32`) for memory-constrained GPUs.
