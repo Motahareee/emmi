@@ -52,22 +52,20 @@ Default splits: 5,000 / 500 / 500 (`--n-train --n-valid --n-test`). Headline pap
 
 ## Results (64-dim compression, 256B payload = 32× reduction)
 
-| Method | Supervision | CLIP+match (GPT-2) | CLIP+match (LLaVA) | MobileCLIP+match (GPT-2) | MobileCLIP+match (LLaVA) |
-|---|---|---|---|---|---|
-| None (uncompressed, 2048-dim) | — | 97.92% | 96.70% | 98.41% | 97.91% |
-| PCA-64 | none | 96.88% | not run | 57.35% | unresolved instability† |
-| AE-64 | none | 93.40% | 84.22% | 52.01% | unresolved instability† |
-| VAE-64 | none | 96.75% | 95.75% | 69.87% | unresolved instability† |
-| BlockPCA-64 | none | 97.12% | 95.28% | 97.85% | 82.97% |
-| LDA-64 | labels | 97.78% | 93.72% | 98.33% | unresolved instability† |
-| CrossModalAE-64 (task-agnostic) | pairs only | 94.09% | 90.49% | 90.30% | 90.64% |
-| ContrastiveAE-64 (task-aware) | labels | 98.08% | unresolved instability† | 98.32% | 98.19% |
-
-MobileCLIP embeddings have higher intrinsic dimensionality than CLIP's, which is why generic compressors (PCA/AE/VAE) collapse on MobileCLIP but not CLIP under GPT-2 — structure-aware methods (LDA, BlockPCA, ContrastiveAE) are robust to this because they exploit task- or block-level structure rather than raw variance alone.
+| Method | Supervision | CLIP+match (GPT-2) | CLIP+match (LLaVA) |
+|---|---|---|---|
+| None (uncompressed, 2048-dim) | — | 97.92% | 96.70% |
+| PCA-64 | none | 96.88% | not run |
+| AE-64 | none | 93.40% | 84.22% |
+| VAE-64 | none | 96.75% | 95.75% |
+| BlockPCA-64 | none | 97.12% | 95.28% |
+| LDA-64 | labels | 97.78% | 93.72% |
+| CrossModalAE-64 (task-agnostic) | pairs only | 94.09% | 90.49% |
+| ContrastiveAE-64 (task-aware) | labels | 98.08% | unresolved instability† |
 
 `train_llava.py` runs the LLaVA-1.5-7B `language_model` backbone (vision tower discarded, EMMI's own soft tokens injected instead) in place of GPT-2, reusing an already-trained compressor checkpoint rather than retraining it — see `--load-in-8bit` / `--llm-dtype float32` above for memory-constrained GPUs.
 
-**† Unresolved instability:** these cells never actually trained — gradients go non-finite on nearly every batch and the model stays at its random initialization (~50% accuracy). Confirmed independent of the projection's random seed and of precision (both 8-bit and genuine fp32 fail identically); root cause is still under investigation. See `slurm/test_llava_*.sh` for the diagnostic scripts.
+**† Unresolved instability:** this cell never actually trained — gradients go non-finite on nearly every batch and the model stays at its random initialization (~50% accuracy). Confirmed independent of the projection's random seed and of precision (both 8-bit and genuine fp32 fail identically); root cause is still under investigation. See `slurm/test_llava_*.sh` for the diagnostic scripts.
 
 ## Project Structure
 
