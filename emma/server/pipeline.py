@@ -23,6 +23,8 @@ discarded — we replace it with EMMA's VAEDecoder + custom projection.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from types import SimpleNamespace
 from transformers import AutoModelForCausalLM
 
 from emma.compression.vae import VAE, VAEDecoder
@@ -347,3 +349,236 @@ def create_server_pipeline(config: EMMAConfig = None,
         n_soft_tokens=sc.n_soft_tokens,
         freeze_llm=sc.freeze_llm,
     )
+
+
+# ---------------------------------------------------------------------------
+# Open-ended generation support (VQA, and any future free-form-text task)
+# ---------------------------------------------------------------------------
+#
+# The classes/functions above only ever needed hidden states -- enough for
+# binary classification via match_head. Open-ended generation needs actual
+# vocabulary logits and a loss computed over generated tokens, which not
+# every scenario's extracted backbone provides:
+#
+#   "causal_lm" (GPT-2, Mistral) -- _load_llm already keeps the *full*
+#       AutoModelForCausalLM, which natively supports inputs_embeds +
+#       labels=... and computes its own shifted cross-entropy loss.
+#   "llava" -- _load_llm extracts just model.model.language_model, the
+#       bare transformer body with no lm_head at all (classification
+#       never needed one). Generation does, so here we keep a reference
+#       to the original model.lm_head alongside the bare backbone.
+#
+# GenerativeLLM below gives both cases the same forward(inputs_embeds,
+# attention_mask, labels=None) -> (.loss, .logits) interface so
+# ServerPipelineVQA doesn't need to know which scenario it's running.
+#
+# Only "llava" and "causal_lm" loaders are wired up here -- "qwen_audio"
+# is registered in SCENARIO_REGISTRY but has never been validated in this
+# project (see README), so it's left unimplemented rather than guessed at.
+
+
+class GenerativeLLM(nn.Module):
+    """
+    Wraps a frozen backbone (+ lm_head, if the backbone doesn't already
+    have one) behind one interface: forward(inputs_embeds, attention_mask,
+    labels=None) -> object with .loss (or None) and .logits.
+    """
+
+    def __init__(self, backbone: nn.Module, lm_head: nn.Module = None):
+        super().__init__()
+        self.backbone = backbone
+        self.lm_head  = lm_head  # None => backbone already computes logits/loss itself
+
+    def get_input_embeddings(self):
+        return self.backbone.get_input_embeddings()
+
+    def forward(self, inputs_embeds: torch.Tensor,
+                attention_mask: torch.Tensor,
+                labels: torch.Tensor = None):
+        if self.lm_head is None:
+            # Full CausalLM (GPT-2 / Mistral) -- already supports labels=
+            # directly and computes the shifted cross-entropy loss itself.
+            return self.backbone(inputs_embeds=inputs_embeds,
+                                 attention_mask=attention_mask, labels=labels)
+
+        # Bare backbone (llava) -- run it, then apply the saved lm_head
+        # ourselves and compute the loss the same way HF's own CausalLM
+        # forward does internally (shift-by-one cross-entropy).
+        out = self.backbone(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        logits = self.lm_head(hidden.to(dtype=self.lm_head.weight.dtype))
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+        return SimpleNamespace(loss=loss, logits=logits)
+
+
+def _load_llm_for_generation(scenario: str, load_in_8bit: bool = False,
+                             dtype: str = "float16"):
+    """
+    Like _load_llm, but returns a GenerativeLLM wrapper supporting
+    labels=... teacher-forcing loss and vocabulary logits -- needed for
+    open-ended generation tasks (e.g. VQA) that classification-only
+    _load_llm doesn't support. See module-level note above for why
+    "llava" needs different handling than "causal_lm".
+
+    Only "llava" and "causal_lm" loaders are implemented.
+    """
+    entry  = SCENARIO_REGISTRY[scenario]
+    name   = entry["model_name"]
+    loader = entry["loader"]
+    torch_dtype = {"float16": torch.float16, "float32": torch.float32}[dtype]
+
+    kwargs = {}
+    if load_in_8bit:
+        from transformers import BitsAndBytesConfig
+        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+
+    if loader == "llava":
+        from transformers import LlavaForConditionalGeneration
+        model    = LlavaForConditionalGeneration.from_pretrained(name, **kwargs)
+        backbone = model.model.language_model
+        lm_head  = model.lm_head
+        d_llm    = model.config.text_config.hidden_size
+        if not load_in_8bit:
+            backbone = backbone.to(dtype=torch_dtype)
+            lm_head  = lm_head.to(dtype=torch_dtype)
+        llm = GenerativeLLM(backbone, lm_head)
+
+    elif loader == "causal_lm":
+        model = AutoModelForCausalLM.from_pretrained(name, **kwargs)
+        d_llm = model.config.hidden_size
+        llm   = GenerativeLLM(model, lm_head=None)
+
+    else:
+        raise NotImplementedError(
+            f"_load_llm_for_generation does not support loader={loader!r} "
+            f"(scenario={scenario!r}) -- only 'llava' and 'causal_lm' are "
+            f"wired up for open-ended generation tasks."
+        )
+
+    return llm, d_llm
+
+
+class ServerPipelineVQA(nn.Module):
+    """
+    Server-side pipeline for open-ended VQA (visual question answering).
+
+    Unlike ServerPipeline (binary match classification via a linear head),
+    this generates a free-form text answer: soft tokens (from the
+    compressed image representation) + question tokens go to the frozen
+    LLM. During training, answer tokens are appended with teacher forcing
+    and next-token cross-entropy loss is computed over the answer
+    positions only (question/soft-token positions are masked out via
+    label = -100). At inference, generate_answer() produces the answer
+    autoregressively via greedy decoding.
+
+    Note the input is image-only at the soft-token level (no caption to
+    fuse with, since generating the answer is the task) -- multimodality
+    is preserved by the question text, which is concatenated after the
+    soft tokens exactly as instruction text is in ServerPipeline.
+    """
+
+    def __init__(self, llm: GenerativeLLM, d_llm: int,
+                 projection: nn.Module, n_soft_tokens: int,
+                 freeze_llm: bool = True, vae_decoder: VAEDecoder = None):
+        super().__init__()
+        self.vae_decoder   = vae_decoder
+        self.projection    = projection
+        self.llm           = llm
+        self.n_soft_tokens = n_soft_tokens
+        self.d_llm         = d_llm
+
+        if freeze_llm:
+            for p in self.llm.parameters():
+                p.requires_grad = False
+
+    def _soft_tokens(self, z: torch.Tensor) -> torch.Tensor:
+        B = z.size(0)
+        emb  = self.vae_decoder(z) if self.vae_decoder is not None else z
+        soft = self.projection(emb)
+        return soft.view(B, self.n_soft_tokens, -1)
+
+    def forward(self, z: torch.Tensor,
+                question_ids: torch.Tensor, question_mask: torch.Tensor,
+                answer_ids: torch.Tensor = None,
+                answer_mask: torch.Tensor = None) -> dict:
+        """
+        Training: pass answer_ids/answer_mask for teacher forcing -> {"loss": scalar}.
+        Without them, runs the question-only prefix -> {"logits": [...]}
+        (rarely used directly; prefer generate_answer() for real inference).
+        """
+        B = z.size(0)
+        soft = self._soft_tokens(z)  # [B, n, d_llm]
+
+        llm_dtype = next(self.llm.parameters()).dtype
+        q_emb = self.llm.get_input_embeddings()(question_ids)  # [B, Lq, d_llm]
+        soft_mask = torch.ones(B, self.n_soft_tokens,
+                               device=z.device, dtype=question_mask.dtype)
+
+        if answer_ids is not None:
+            a_emb = self.llm.get_input_embeddings()(answer_ids)  # [B, La, d_llm]
+            combined  = torch.cat([soft, q_emb, a_emb], dim=1).to(dtype=llm_dtype)
+            full_mask = torch.cat([soft_mask, question_mask, answer_mask], dim=1)
+
+            ignore = torch.full((B, self.n_soft_tokens + question_ids.size(1)), -100,
+                                device=z.device, dtype=torch.long)
+            answer_labels = answer_ids.masked_fill(answer_mask == 0, -100)
+            labels = torch.cat([ignore, answer_labels], dim=1)
+
+            out = self.llm(inputs_embeds=combined, attention_mask=full_mask, labels=labels)
+            return {"loss": out.loss}
+
+        combined  = torch.cat([soft, q_emb], dim=1).to(dtype=llm_dtype)
+        full_mask = torch.cat([soft_mask, question_mask], dim=1)
+        out = self.llm(inputs_embeds=combined, attention_mask=full_mask)
+        return {"logits": out.logits}
+
+    @torch.no_grad()
+    def generate_answer(self, z: torch.Tensor,
+                        question_ids: torch.Tensor, question_mask: torch.Tensor,
+                        eos_token_id: int, max_new_tokens: int = 8) -> torch.Tensor:
+        """
+        Greedy autoregressive decoding: soft tokens + question in, generate
+        answer tokens one at a time until eos_token_id or max_new_tokens.
+        A manual loop rather than HF's .generate(), since inputs_embeds-based
+        generation through a custom wrapper (llava's bare backbone + our
+        own lm_head) isn't guaranteed to be supported by .generate() directly.
+
+        Returns: [B, <=max_new_tokens] generated token ids.
+        """
+        self.eval()
+        B = z.size(0)
+        soft = self._soft_tokens(z)
+        llm_dtype = next(self.llm.parameters()).dtype
+        q_emb = self.llm.get_input_embeddings()(question_ids)
+        soft_mask = torch.ones(B, self.n_soft_tokens,
+                               device=z.device, dtype=question_mask.dtype)
+
+        combined = torch.cat([soft, q_emb], dim=1).to(dtype=llm_dtype)
+        mask     = torch.cat([soft_mask, question_mask], dim=1)
+
+        generated = torch.zeros(B, 0, dtype=torch.long, device=z.device)
+        finished  = torch.zeros(B, dtype=torch.bool, device=z.device)
+
+        for _ in range(max_new_tokens):
+            out = self.llm(inputs_embeds=combined, attention_mask=mask)
+            next_id = out.logits[:, -1, :].argmax(dim=-1)               # [B]
+            next_id = torch.where(finished, torch.full_like(next_id, eos_token_id), next_id)
+            generated = torch.cat([generated, next_id.unsqueeze(1)], dim=1)
+            finished  = finished | (next_id == eos_token_id)
+            if finished.all():
+                break
+
+            next_emb = self.llm.get_input_embeddings()(next_id).unsqueeze(1).to(dtype=llm_dtype)
+            combined = torch.cat([combined, next_emb], dim=1)
+            mask     = torch.cat([mask, torch.ones(B, 1, device=z.device, dtype=mask.dtype)], dim=1)
+
+        return generated
