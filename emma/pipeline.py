@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from emma.config import EMMAConfig
-from emma.encoders import TextEncoder, ImageEncoder
+from emma.encoders import TextEncoder, ImageEncoder, AudioEncoder
 from emma.alignment import CrossModalAlignment
 from emma.compression.vae import VAE
 
@@ -120,6 +120,99 @@ class EdgePipeline(nn.Module):
         """
         t, v  = self._encode_parallel(text_inputs, image_inputs["pixel_values"])
         fused = self.alignment(t, v)                          # [B, 512]
+
+        if not self.use_compression:
+            return fused
+
+        if training:
+            mu, log_var = self.vae_encoder(fused)
+            return mu, log_var, fused
+        else:
+            return self.vae_encoder.encode(fused)             # [B, d_latent]
+
+
+class AVEdgePipeline(nn.Module):
+    """
+    Edge-side pipeline (Stages 1-3) for tasks where the two modalities that
+    must be *compressed together* are audio and video, not text and image
+    (see emma/data/avqa.py) -- e.g. audio-visual QA, where a question like
+    "how many instruments are sounding" cannot be answered from either
+    modality alone. The question text itself is not fused/compressed here;
+    like ServerPipelineVQA's question handling, it goes to the server as
+    plain token embeddings (see train_avqa.py) -- compressing natural
+    language into a fixed-size latent would destroy exactly the information
+    the answer depends on. Only image (frozen CLIP/MobileCLIP) and audio
+    (small trained-from-scratch CNN, no equivalent pretrained-and-frozen
+    checkpoint exists) are fused and compressed here.
+
+    Stages:
+        1. Image encoder — K sampled frames -> [B, K, 512] -> mean-pooled
+           over time -> [B, 512]. Audio encoder — waveform -> [B, 512].
+        2. Cross-modal fusion (reused unchanged from EdgePipeline — fusion
+           modes are modality-agnostic, they just combine two 512-dim
+           vectors).
+        3. VAE encoder — compress to latent z (optional).
+
+    use_compression=False skips Stage 3 — the fused embedding is transmitted.
+    """
+
+    def __init__(self, config: EMMAConfig = None, vae_checkpoint: str = None,
+                 audio_encoder: nn.Module = None,
+                 image_encoder: nn.Module = None):
+        super().__init__()
+        cfg = config or EMMAConfig()
+        ec  = cfg.encoder
+        ac  = cfg.alignment
+        vc  = cfg.vae
+        self.use_compression = cfg.use_compression
+
+        self.audio_encoder = audio_encoder or AudioEncoder()
+
+        if image_encoder is not None:
+            self.image_encoder = image_encoder
+        elif ec.family == "mobileclip":
+            from emma.encoders.mobileclip_encoder import build_mobileclip_encoders
+            _, self.image_encoder = build_mobileclip_encoders(freeze_base=ec.image_freeze_base)
+        else:
+            self.image_encoder = ImageEncoder(
+                model_name=ec.model_name, freeze_base=ec.image_freeze_base,
+            )
+
+        self.alignment = CrossModalAlignment(d_shared=ac.d_shared, fusion=ac.fusion)
+
+        if self.use_compression:
+            if vae_checkpoint is not None:
+                self.vae_encoder = VAE.load(vae_checkpoint).encoder
+            else:
+                self.vae_encoder = VAE(
+                    d_in=self.alignment.d_out,
+                    d_latent=vc.d_latent,
+                    encoder_hidden_dims=vc.encoder_hidden_dims,
+                    decoder_hidden_dims=tuple(reversed(vc.encoder_hidden_dims)),
+                ).encoder
+        else:
+            self.vae_encoder = None
+
+    def _encode_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        """frames: [B, K, 3, H, W] -> mean-pooled over K -> [B, 512]"""
+        B, K = frames.shape[:2]
+        flat = frames.reshape(B * K, *frames.shape[2:])
+        emb  = self.image_encoder(flat).reshape(B, K, -1)
+        return emb.mean(dim=1)
+
+    def forward(self, waveform: torch.Tensor, frames: torch.Tensor,
+                training: bool = True):
+        """
+        Args:
+            waveform : [B, T]        mono 16kHz
+            frames   : [B, K, 3, H, W]
+            training : controls VAE output (ignored when use_compression=False)
+
+        Returns: same shape convention as EdgePipeline.forward.
+        """
+        a     = self.audio_encoder(waveform)
+        v     = self._encode_frames(frames)
+        fused = self.alignment(a, v)                          # [B, d_out]
 
         if not self.use_compression:
             return fused
