@@ -16,3 +16,5 @@ mmsdk_cache/
 # Misc
 workspace/
 .coco_cache/
+.avqa_cache/
+.onnx_cache/
