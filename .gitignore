@@ -18,3 +18,4 @@ workspace/
 .coco_cache/
 .avqa_cache/
 .onnx_cache/
+.cifar10_cache/

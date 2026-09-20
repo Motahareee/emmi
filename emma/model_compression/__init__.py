@@ -5,6 +5,7 @@ from .onnx_static import (
     summarize_onnx_graph, build_ort_session,
 )
 from .sensitivity import get_quantizable_nodes, sweep_node_sensitivity
+from .qat import QATLinear, convert_to_qat, distillation_loss
 
 __all__ = [
     "quantize_encoder_ptq", "model_size_mb", "select_quantized_engine",
@@ -12,4 +13,5 @@ __all__ = [
     "export_image_encoder_to_onnx", "ImageCalibrationReader", "quantize_onnx_static",
     "summarize_onnx_graph", "build_ort_session",
     "get_quantizable_nodes", "sweep_node_sensitivity",
+    "QATLinear", "convert_to_qat", "distillation_loss",
 ]
