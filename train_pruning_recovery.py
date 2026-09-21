@@ -35,6 +35,9 @@ from eval_ptq import build_clip, _cosine_sim
 from eval_zeroshot_compare import zero_shot_accuracy
 
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def _parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ratio", type=float, default=0.3,
@@ -43,6 +46,9 @@ def _parse_args():
     p.add_argument("--n-eval", type=int, default=64)
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--batch-size", type=int, default=8,
+                   help="8 was chosen for CPU memory limits during the "
+                        "initial investigation -- raise substantially on GPU")
     p.add_argument("--n-zeroshot", type=int, default=200)
     return p.parse_args()
 
@@ -50,7 +56,9 @@ def _parse_args():
 def main():
     args = _parse_args()
     torch.manual_seed(0)
-    torch.set_num_threads(4)
+    if DEVICE == "cpu":
+        torch.set_num_threads(4)
+    print(f"Using device: {DEVICE}")
 
     n_total = args.n_train + args.n_eval
     print(f"Loading {n_total} real COCO images/captions "
@@ -65,15 +73,15 @@ def main():
     zeroshot_labels = [ds[i][1] for i in range(args.n_zeroshot)]
 
     teacher_image, text_encoder, proc, tok = build_clip()
-    teacher_image.eval()
-    text_encoder.eval()
+    teacher_image = teacher_image.to(DEVICE).eval()
+    text_encoder = text_encoder.to(DEVICE).eval()
     for p in teacher_image.parameters():
         p.requires_grad = False
     for p in text_encoder.parameters():
         p.requires_grad = False
 
-    train_pv = proc(images=train_images, return_tensors="pt")["pixel_values"]
-    eval_pv = proc(images=eval_images, return_tensors="pt")["pixel_values"]
+    train_pv = proc(images=train_images, return_tensors="pt")["pixel_values"].to(DEVICE)
+    eval_pv = proc(images=eval_images, return_tensors="pt")["pixel_values"].to(DEVICE)
 
     with torch.no_grad():
         teacher_train_out = teacher_image(train_pv)
@@ -87,11 +95,11 @@ def main():
     no_recovery_cos = _cosine_sim(teacher_eval_out, pruned_only_eval_out)
 
     def pruned_only_embed(imgs):
-        pv = proc(images=imgs, return_tensors="pt")["pixel_values"]
+        pv = proc(images=imgs, return_tensors="pt")["pixel_values"].to(DEVICE)
         return pruned_only(pv)
 
     no_recovery_acc = zero_shot_accuracy(pruned_only_embed, text_encoder, tok,
-                                         zeroshot_images, zeroshot_labels)
+                                         zeroshot_images, zeroshot_labels, device=DEVICE)
     print(f"\nNo recovery (ratio={args.ratio}): "
           f"held-out cos_sim={no_recovery_cos:.4f}  zero-shot acc={no_recovery_acc:.4f}")
 
@@ -102,7 +110,7 @@ def main():
         p.requires_grad = True
     optimizer = AdamW(student.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    BATCH_SIZE = 8
+    BATCH_SIZE = args.batch_size
     n_train = train_pv.size(0)
     for epoch in range(1, args.epochs + 1):
         student.train()
@@ -126,11 +134,11 @@ def main():
     recovered_cos = _cosine_sim(teacher_eval_out, student_eval_out)
 
     def student_embed(imgs):
-        pv = proc(images=imgs, return_tensors="pt")["pixel_values"]
+        pv = proc(images=imgs, return_tensors="pt")["pixel_values"].to(DEVICE)
         return student(pv)
 
     recovered_acc = zero_shot_accuracy(student_embed, text_encoder, tok,
-                                       zeroshot_images, zeroshot_labels)
+                                       zeroshot_images, zeroshot_labels, device=DEVICE)
 
     print("\n=== Summary ===")
     print(f"  size: {model_size_mb(teacher_image):.1f} -> {model_size_mb(student):.1f} MB")

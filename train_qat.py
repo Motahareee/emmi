@@ -26,12 +26,20 @@ from eval_ptq import build_clip, build_mobileclip, _cosine_sim
 from eval_zeroshot_compare import zero_shot_accuracy
 
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def _parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--n-train", type=int, default=64)
     p.add_argument("--n-eval", type=int, default=32)
     p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--batch-size", type=int, default=8,
+                   help="8 was chosen for CPU memory limits during the "
+                        "initial investigation -- raise substantially on GPU "
+                        "(e.g. 64-128) where activation memory is not the "
+                        "binding constraint")
     p.add_argument("--n-zeroshot", type=int, default=200,
                    help="CIFAR-10 test images for real zero-shot accuracy "
                         "(not just cos_sim vs the model's own fp32 output)")
@@ -40,29 +48,31 @@ def _parse_args():
 
 def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
                  train_images, train_captions, eval_images, eval_captions,
-                 epochs: int, lr: float,
+                 epochs: int, lr: float, batch_size: int,
                  zeroshot_images=None, zeroshot_labels=None) -> dict:
-    print(f"\n=== {name} QAT fine-tuning ===")
-    teacher_image.eval()
-    teacher_text.eval()
+    print(f"\n=== {name} QAT fine-tuning (device={DEVICE}) ===")
+    teacher_image = teacher_image.to(DEVICE).eval()
+    teacher_text = teacher_text.to(DEVICE).eval()
 
     # Convert to QAT (which deepcopies) BEFORE freezing the teacher --
     # deepcopy preserves requires_grad, so freezing first would have left
     # the student's copied weights frozen too.
-    student_image = convert_to_qat(teacher_image)
-    student_text = convert_to_qat(teacher_text)
+    student_image = convert_to_qat(teacher_image).to(DEVICE)
+    student_text = convert_to_qat(teacher_text).to(DEVICE)
 
     for p in teacher_image.parameters():
         p.requires_grad = False
     for p in teacher_text.parameters():
         p.requires_grad = False
 
-    train_pv = proc(images=train_images, return_tensors="pt")["pixel_values"]
+    train_pv = proc(images=train_images, return_tensors="pt")["pixel_values"].to(DEVICE)
     train_txt = tok(train_captions, max_length=32, padding="max_length",
                     truncation=True, return_tensors="pt")
-    eval_pv = proc(images=eval_images, return_tensors="pt")["pixel_values"]
+    train_txt = {k: v.to(DEVICE) for k, v in train_txt.items()}
+    eval_pv = proc(images=eval_images, return_tensors="pt")["pixel_values"].to(DEVICE)
     eval_txt = tok(eval_captions, max_length=32, padding="max_length",
                    truncation=True, return_tensors="pt")
+    eval_txt = {k: v.to(DEVICE) for k, v in eval_txt.items()}
 
     params = list(student_image.parameters()) + list(student_text.parameters())
     optimizer = AdamW(params, lr=lr, weight_decay=1e-4)
@@ -74,7 +84,7 @@ def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
     # regardless of how large train_images is (the weight-side cost is
     # batch-independent, but this is still the lever that's actually
     # under our control here).
-    BATCH_SIZE = 8
+    BATCH_SIZE = batch_size
     n_train = train_pv.size(0)
 
     with torch.no_grad():
@@ -121,10 +131,11 @@ def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
 
     if zeroshot_images is not None:
         def qat_embed(imgs):
-            pv = proc(images=imgs, return_tensors="pt")["pixel_values"]
+            pv = proc(images=imgs, return_tensors="pt")["pixel_values"].to(DEVICE)
             return student_image(pv)
 
-        acc = zero_shot_accuracy(qat_embed, student_text, tok, zeroshot_images, zeroshot_labels)
+        acc = zero_shot_accuracy(qat_embed, student_text, tok, zeroshot_images, zeroshot_labels,
+                                 device=DEVICE)
         result["zeroshot_accuracy"] = acc
         print(f"  zero-shot CIFAR-10 accuracy (real task accuracy, not cos_sim): {acc:.4f}")
 
@@ -156,18 +167,20 @@ def main():
     clip_img, clip_txt, clip_proc, clip_tok = build_clip()
     qat_finetune("CLIP", clip_img, clip_txt, clip_proc, clip_tok,
                 train_images, train_captions, eval_images, eval_captions,
-                args.epochs, args.lr, zeroshot_images, zeroshot_labels)
+                args.epochs, args.lr, args.batch_size, zeroshot_images, zeroshot_labels)
     # Each qat_finetune call holds teacher + student + AdamW momentum/
     # variance buffers in memory (student is fully trainable, unlike PTQ's
     # frozen-encoder scripts) -- free CLIP's before building MobileCLIP's
     # rather than letting both stack up in main()'s scope simultaneously.
     del clip_img, clip_txt
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     mc_img, mc_txt, mc_proc, mc_tok = build_mobileclip()
     qat_finetune("MobileCLIP", mc_img, mc_txt, mc_proc, mc_tok,
                 train_images, train_captions, eval_images, eval_captions,
-                args.epochs, args.lr, zeroshot_images, zeroshot_labels)
+                args.epochs, args.lr, args.batch_size, zeroshot_images, zeroshot_labels)
 
 
 if __name__ == "__main__":

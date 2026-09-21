@@ -52,11 +52,13 @@ def _parse_args():
 
 @torch.no_grad()
 def zero_shot_accuracy(image_embed_fn, text_encoder, tok, images, labels,
-                       batch_size: int = 16) -> float:
+                       batch_size: int = 16, device: str = "cpu") -> float:
     """
     image_embed_fn: callable(list[PIL.Image]) -> torch.Tensor [N, 512]
     (lets the image side be either a PyTorch encoder or an ONNX session
-    without this function caring which).
+    without this function caring which; image_embed_fn is responsible for
+    moving its own output to `device` if it isn't already there -- e.g. an
+    ONNX session naturally returns CPU tensors regardless of this arg).
 
     Images are embedded in chunks of batch_size rather than one giant
     forward call -- a 200-image single-batch forward through a Conv-heavy
@@ -68,18 +70,19 @@ def zero_shot_accuracy(image_embed_fn, text_encoder, tok, images, labels,
     prompts = [f"a photo of a {c}" for c in CIFAR10_CLASSES]
     text_inputs = tok(prompts, max_length=32, padding="max_length",
                       truncation=True, return_tensors="pt")
+    text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
     text_emb = text_encoder(**text_inputs)
     text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
 
     img_embs = []
     for start in range(0, len(images), batch_size):
-        chunk = image_embed_fn(images[start:start + batch_size])
+        chunk = image_embed_fn(images[start:start + batch_size]).to(device)
         img_embs.append(chunk / chunk.norm(dim=-1, keepdim=True))
     img_emb = torch.cat(img_embs, dim=0)
 
     sims = img_emb @ text_emb.T
     preds = sims.argmax(dim=-1)
-    correct = (preds == torch.tensor(labels)).sum().item()
+    correct = (preds == torch.tensor(labels, device=device)).sum().item()
     return correct / len(labels)
 
 

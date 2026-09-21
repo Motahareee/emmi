@@ -18,4 +18,10 @@ pip install --user \
 pip install --user \
     transformers datasets numpy
 
+# emma/encoders/mobileclip_encoder.py (--encoder mobileclip everywhere,
+# including the compression scripts in this directory) needs open_clip --
+# not previously tracked here even though mobileclip runs already
+# depended on it being present.
+pip install --user open_clip_torch
+
 echo "=== Done. Test with: python3 -c 'import torch; print(torch.cuda.is_available())' ==="
