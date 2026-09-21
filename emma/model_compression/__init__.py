@@ -6,6 +6,7 @@ from .onnx_static import (
 )
 from .sensitivity import get_quantizable_nodes, sweep_node_sensitivity
 from .qat import QATLinear, convert_to_qat, distillation_loss
+from .pruning import compute_channel_importance, prune_mlp_pair, prune_clip_vit_mlps
 
 __all__ = [
     "quantize_encoder_ptq", "model_size_mb", "select_quantized_engine",
@@ -14,4 +15,5 @@ __all__ = [
     "summarize_onnx_graph", "build_ort_session",
     "get_quantizable_nodes", "sweep_node_sensitivity",
     "QATLinear", "convert_to_qat", "distillation_loss",
+    "compute_channel_importance", "prune_mlp_pair", "prune_clip_vit_mlps",
 ]

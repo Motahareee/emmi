@@ -23,6 +23,7 @@ from torch.optim import AdamW
 from emma.data.coco import _stream_samples
 from emma.model_compression import convert_to_qat, distillation_loss, model_size_mb
 from eval_ptq import build_clip, build_mobileclip, _cosine_sim
+from eval_zeroshot_compare import zero_shot_accuracy
 
 
 def _parse_args():
@@ -31,12 +32,16 @@ def _parse_args():
     p.add_argument("--n-eval", type=int, default=32)
     p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--n-zeroshot", type=int, default=200,
+                   help="CIFAR-10 test images for real zero-shot accuracy "
+                        "(not just cos_sim vs the model's own fp32 output)")
     return p.parse_args()
 
 
 def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
                  train_images, train_captions, eval_images, eval_captions,
-                 epochs: int, lr: float) -> dict:
+                 epochs: int, lr: float,
+                 zeroshot_images=None, zeroshot_labels=None) -> dict:
     print(f"\n=== {name} QAT fine-tuning ===")
     teacher_image.eval()
     teacher_text.eval()
@@ -111,7 +116,19 @@ def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
     img_cos = _cosine_sim(eval_teacher_img, eval_student_img)
     txt_cos = _cosine_sim(eval_teacher_txt, eval_student_txt)
     print(f"  held-out eval cos_sim: image={img_cos:.4f}  text={txt_cos:.4f}")
-    return {"image_cos_sim": img_cos, "text_cos_sim": txt_cos, "final_loss": loss.item()}
+
+    result = {"image_cos_sim": img_cos, "text_cos_sim": txt_cos, "final_loss": loss.item()}
+
+    if zeroshot_images is not None:
+        def qat_embed(imgs):
+            pv = proc(images=imgs, return_tensors="pt")["pixel_values"]
+            return student_image(pv)
+
+        acc = zero_shot_accuracy(qat_embed, student_text, tok, zeroshot_images, zeroshot_labels)
+        result["zeroshot_accuracy"] = acc
+        print(f"  zero-shot CIFAR-10 accuracy (real task accuracy, not cos_sim): {acc:.4f}")
+
+    return result
 
 
 def main():
@@ -127,12 +144,19 @@ def main():
     train_images, eval_images = images[:args.n_train], images[args.n_train:]
     train_captions, eval_captions = captions[:args.n_train], captions[args.n_train:]
 
+    import torchvision
+    print(f"Loading CIFAR-10 test set ({args.n_zeroshot} images) for real "
+          f"zero-shot accuracy, not just cos_sim...")
+    ds = torchvision.datasets.CIFAR10(root=".cifar10_cache", train=False, download=True)
+    zeroshot_images = [ds[i][0] for i in range(args.n_zeroshot)]
+    zeroshot_labels = [ds[i][1] for i in range(args.n_zeroshot)]
+
     import gc
 
     clip_img, clip_txt, clip_proc, clip_tok = build_clip()
     qat_finetune("CLIP", clip_img, clip_txt, clip_proc, clip_tok,
                 train_images, train_captions, eval_images, eval_captions,
-                args.epochs, args.lr)
+                args.epochs, args.lr, zeroshot_images, zeroshot_labels)
     # Each qat_finetune call holds teacher + student + AdamW momentum/
     # variance buffers in memory (student is fully trainable, unlike PTQ's
     # frozen-encoder scripts) -- free CLIP's before building MobileCLIP's
@@ -143,7 +167,7 @@ def main():
     mc_img, mc_txt, mc_proc, mc_tok = build_mobileclip()
     qat_finetune("MobileCLIP", mc_img, mc_txt, mc_proc, mc_tok,
                 train_images, train_captions, eval_images, eval_captions,
-                args.epochs, args.lr)
+                args.epochs, args.lr, zeroshot_images, zeroshot_labels)
 
 
 if __name__ == "__main__":

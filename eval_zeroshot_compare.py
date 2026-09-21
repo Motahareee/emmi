@@ -51,11 +51,19 @@ def _parse_args():
 
 
 @torch.no_grad()
-def zero_shot_accuracy(image_embed_fn, text_encoder, tok, images, labels) -> float:
+def zero_shot_accuracy(image_embed_fn, text_encoder, tok, images, labels,
+                       batch_size: int = 16) -> float:
     """
     image_embed_fn: callable(list[PIL.Image]) -> torch.Tensor [N, 512]
     (lets the image side be either a PyTorch encoder or an ONNX session
     without this function caring which).
+
+    Images are embedded in chunks of batch_size rather than one giant
+    forward call -- a 200-image single-batch forward through a Conv-heavy
+    model (MobileCLIP) plus fake-quant's extra per-call tensor overhead
+    (QATLinear) pushed memory high enough to get silently OOM-killed with
+    n_zeroshot=200; chunking caps peak activation memory regardless of
+    how many total images are evaluated.
     """
     prompts = [f"a photo of a {c}" for c in CIFAR10_CLASSES]
     text_inputs = tok(prompts, max_length=32, padding="max_length",
@@ -63,8 +71,11 @@ def zero_shot_accuracy(image_embed_fn, text_encoder, tok, images, labels) -> flo
     text_emb = text_encoder(**text_inputs)
     text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
 
-    img_emb = image_embed_fn(images)
-    img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
+    img_embs = []
+    for start in range(0, len(images), batch_size):
+        chunk = image_embed_fn(images[start:start + batch_size])
+        img_embs.append(chunk / chunk.norm(dim=-1, keepdim=True))
+    img_emb = torch.cat(img_embs, dim=0)
 
     sims = img_emb @ text_emb.T
     preds = sims.argmax(dim=-1)
