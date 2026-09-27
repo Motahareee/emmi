@@ -29,6 +29,29 @@ from eval_zeroshot_compare import zero_shot_accuracy
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+@torch.no_grad()
+def _batched_image_forward(model, pv, batch_size):
+    """
+    A full-tensor forward call (no mini-batching) was fine at the CPU
+    investigation's scale (n_train=128) but OOMs on GPU at real scale
+    (n_train=4000+) -- MobileCLIP's Conv-heavy stem produces activation
+    tensors that scale directly with batch size, and a single 4000-image
+    batch tried to allocate 15+ GiB in one shot. Chunking caps peak
+    memory the same way the training loop already does.
+    """
+    outs = [model(pv[i:i + batch_size]) for i in range(0, pv.size(0), batch_size)]
+    return torch.cat(outs, dim=0)
+
+
+@torch.no_grad()
+def _batched_text_forward(model, txt, batch_size):
+    n = txt["input_ids"].size(0)
+    outs = [model(input_ids=txt["input_ids"][i:i + batch_size],
+                  attention_mask=txt["attention_mask"][i:i + batch_size])
+           for i in range(0, n, batch_size)]
+    return torch.cat(outs, dim=0)
+
+
 def _parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--n-train", type=int, default=64)
@@ -87,9 +110,8 @@ def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
     BATCH_SIZE = batch_size
     n_train = train_pv.size(0)
 
-    with torch.no_grad():
-        teacher_img_out = teacher_image(train_pv)
-        teacher_txt_out = teacher_text(**train_txt)
+    teacher_img_out = _batched_image_forward(teacher_image, train_pv, BATCH_SIZE)
+    teacher_txt_out = _batched_text_forward(teacher_text, train_txt, BATCH_SIZE)
 
     for epoch in range(1, epochs + 1):
         student_image.train()
@@ -117,11 +139,10 @@ def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
 
     student_image.eval()
     student_text.eval()
-    with torch.no_grad():
-        eval_teacher_img = teacher_image(eval_pv)
-        eval_teacher_txt = teacher_text(**eval_txt)
-        eval_student_img = student_image(eval_pv)
-        eval_student_txt = student_text(**eval_txt)
+    eval_teacher_img = _batched_image_forward(teacher_image, eval_pv, BATCH_SIZE)
+    eval_teacher_txt = _batched_text_forward(teacher_text, eval_txt, BATCH_SIZE)
+    eval_student_img = _batched_image_forward(student_image, eval_pv, BATCH_SIZE)
+    eval_student_txt = _batched_text_forward(student_text, eval_txt, BATCH_SIZE)
 
     img_cos = _cosine_sim(eval_teacher_img, eval_student_img)
     txt_cos = _cosine_sim(eval_teacher_txt, eval_student_txt)

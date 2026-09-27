@@ -38,6 +38,14 @@ from eval_zeroshot_compare import zero_shot_accuracy
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+@torch.no_grad()
+def _batched_image_forward(model, pv, batch_size):
+    """Same fix as train_qat.py -- a full-tensor forward was fine at
+    n_train=128 (CPU) but OOMs on GPU at real scale (n_train=4000+)."""
+    outs = [model(pv[i:i + batch_size]) for i in range(0, pv.size(0), batch_size)]
+    return torch.cat(outs, dim=0)
+
+
 def _parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ratio", type=float, default=0.3,
@@ -83,15 +91,13 @@ def main():
     train_pv = proc(images=train_images, return_tensors="pt")["pixel_values"].to(DEVICE)
     eval_pv = proc(images=eval_images, return_tensors="pt")["pixel_values"].to(DEVICE)
 
-    with torch.no_grad():
-        teacher_train_out = teacher_image(train_pv)
-        teacher_eval_out = teacher_image(eval_pv)
+    teacher_train_out = _batched_image_forward(teacher_image, train_pv, args.batch_size)
+    teacher_eval_out = _batched_image_forward(teacher_image, eval_pv, args.batch_size)
 
     # --- No-recovery baseline (matches eval_pruning.py) ---
     pruned_only = prune_clip_vit_mlps(teacher_image, args.ratio)
     pruned_only.eval()
-    with torch.no_grad():
-        pruned_only_eval_out = pruned_only(eval_pv)
+    pruned_only_eval_out = _batched_image_forward(pruned_only, eval_pv, args.batch_size)
     no_recovery_cos = _cosine_sim(teacher_eval_out, pruned_only_eval_out)
 
     def pruned_only_embed(imgs):
@@ -129,8 +135,7 @@ def main():
             print(f"  epoch {epoch:02d}/{args.epochs}  distillation loss={epoch_loss / n_batches:.4f}")
 
     student.eval()
-    with torch.no_grad():
-        student_eval_out = student(eval_pv)
+    student_eval_out = _batched_image_forward(student, eval_pv, args.batch_size)
     recovered_cos = _cosine_sim(teacher_eval_out, student_eval_out)
 
     def student_embed(imgs):
