@@ -20,7 +20,16 @@ Learned from the QAT investigation: cos_sim on the fine-tuning domain
 -- so this script reports BOTH, not just cos_sim, for the pruned+recovered
 model, the no-recovery baseline, and the fp32 original.
 
-Usage: python3 train_pruning_recovery.py [--ratio 0.3] [--n-train 128] [--epochs 20]
+--criterion taylor (report Finding 19 follow-up): two independent negative
+results (more epochs, iterative scheduling) ruled out training schedule as
+the lever behind the ~50-64% accuracy ceiling, leaving the pruning
+criterion itself as the next candidate. L2-magnitude only looks at weight
+size; Taylor importance (compute_taylor_importance) looks at each
+channel's actual effect on CLIP's own contrastive loss via one
+forward+backward pass on a calibration batch -- the standard stronger
+alternative in the pruning literature.
+
+Usage: python3 train_pruning_recovery.py [--ratio 0.3] [--n-train 128] [--epochs 20] [--criterion taylor]
 """
 
 import argparse
@@ -30,7 +39,9 @@ import torchvision
 from torch.optim import AdamW
 
 from emma.data.coco import _stream_samples
-from emma.model_compression import prune_clip_vit_mlps, distillation_loss, model_size_mb
+from emma.model_compression import (
+    prune_clip_vit_mlps, distillation_loss, model_size_mb, compute_taylor_importance,
+)
 from eval_ptq import build_clip, _cosine_sim
 from eval_zeroshot_compare import zero_shot_accuracy
 
@@ -58,6 +69,12 @@ def _parse_args():
                    help="8 was chosen for CPU memory limits during the "
                         "initial investigation -- raise substantially on GPU")
     p.add_argument("--n-zeroshot", type=int, default=200)
+    p.add_argument("--criterion", choices=["l2", "l1", "taylor"], default="l2",
+                   help="taylor uses one calibration forward+backward on CLIP's own "
+                        "contrastive loss instead of weight magnitude (see pruning.py)")
+    p.add_argument("--n-calib", type=int, default=64,
+                   help="calibration batch size for --criterion taylor "
+                        "(a subset of the training images/captions)")
     return p.parse_args()
 
 
@@ -73,7 +90,9 @@ def main():
           f"({args.n_train} train / {args.n_eval} held-out eval)...")
     raw = _stream_samples(n_total, offset=0)
     images = [s["image"] for s in raw]
+    captions = [s["captions"][0] for s in raw]
     train_images, eval_images = images[:args.n_train], images[args.n_train:]
+    train_captions = captions[:args.n_train]
 
     print(f"Loading CIFAR-10 test set ({args.n_zeroshot} images) for real zero-shot accuracy...")
     ds = torchvision.datasets.CIFAR10(root=".cifar10_cache", train=False, download=True)
@@ -94,8 +113,23 @@ def main():
     teacher_train_out = _batched_image_forward(teacher_image, train_pv, args.batch_size)
     teacher_eval_out = _batched_image_forward(teacher_image, eval_pv, args.batch_size)
 
+    importances = None
+    if args.criterion == "taylor":
+        print(f"\nComputing Taylor importance from a {args.n_calib}-image "
+              f"calibration batch (CLIP's own contrastive loss)...")
+        calib_pv = train_pv[:args.n_calib]
+        calib_txt = tok(train_captions[:args.n_calib], max_length=32, padding="max_length",
+                        truncation=True, return_tensors="pt")
+        calib_txt = {k: v.to(DEVICE) for k, v in calib_txt.items()}
+        for p in teacher_image.parameters():
+            p.requires_grad = True
+        importances = compute_taylor_importance(teacher_image, text_encoder, calib_pv,
+                                                 calib_txt["input_ids"], calib_txt["attention_mask"])
+        for p in teacher_image.parameters():
+            p.requires_grad = False
+
     # --- No-recovery baseline (matches eval_pruning.py) ---
-    pruned_only = prune_clip_vit_mlps(teacher_image, args.ratio)
+    pruned_only = prune_clip_vit_mlps(teacher_image, args.ratio, args.criterion, importances)
     pruned_only.eval()
     pruned_only_eval_out = _batched_image_forward(pruned_only, eval_pv, args.batch_size)
     no_recovery_cos = _cosine_sim(teacher_eval_out, pruned_only_eval_out)
@@ -110,8 +144,8 @@ def main():
           f"held-out cos_sim={no_recovery_cos:.4f}  zero-shot acc={no_recovery_acc:.4f}")
 
     # --- Prune + recovery fine-tune ---
-    print(f"\n=== Pruning (ratio={args.ratio}) + recovery fine-tuning ===")
-    student = prune_clip_vit_mlps(teacher_image, args.ratio)
+    print(f"\n=== Pruning (ratio={args.ratio}, criterion={args.criterion}) + recovery fine-tuning ===")
+    student = prune_clip_vit_mlps(teacher_image, args.ratio, args.criterion, importances)
     for p in student.parameters():
         p.requires_grad = True
     optimizer = AdamW(student.parameters(), lr=args.lr, weight_decay=1e-4)
