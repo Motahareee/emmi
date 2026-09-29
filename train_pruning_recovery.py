@@ -99,6 +99,10 @@ def _parse_args():
                    help="relational matches teacher/student similarity distributions over "
                         "in-batch (image, caption) pairs instead of raw embedding "
                         "cosine-similarity (see relational_distillation_loss)")
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="if >0, run the full held-out cos_sim + zero-shot accuracy check "
+                        "every N epochs (plus the final epoch) to see the trajectory, not "
+                        "just the endpoint -- 0 disables (matches prior scripts' behavior)")
     return p.parse_args()
 
 
@@ -211,6 +215,25 @@ def main():
 
         if epoch % 5 == 0 or epoch == 1:
             print(f"  epoch {epoch:02d}/{args.epochs}  {args.recovery_loss} loss={epoch_loss / n_batches:.4f}")
+
+        if args.eval_every and (epoch % args.eval_every == 0 or epoch == args.epochs):
+            # Trajectory tracking (information-theoretic-ceiling test, Finding 25
+            # follow-up): a single endpoint number can't distinguish "still
+            # climbing, just needs more epochs" from "plateaued early, more
+            # training won't help" -- Finding 18 showed accuracy can even fall
+            # after a mid-training peak, invisible without periodic checks.
+            student.eval()
+            trk_eval_out = _batched_image_forward(student, eval_pv, args.batch_size)
+            trk_cos = _cosine_sim(teacher_eval_out, trk_eval_out)
+
+            def trk_embed(imgs):
+                pv = proc(images=imgs, return_tensors="pt")["pixel_values"].to(DEVICE)
+                return student(pv)
+
+            trk_acc = zero_shot_accuracy(trk_embed, text_encoder, tok,
+                                         zeroshot_images, zeroshot_labels, device=DEVICE)
+            print(f"    [epoch {epoch:02d}] held-out cos_sim={trk_cos:.4f}  zero-shot acc={trk_acc:.4f}")
+            student.train()
 
     student.eval()
     student_eval_out = _batched_image_forward(student, eval_pv, args.batch_size)
