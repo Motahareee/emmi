@@ -147,7 +147,16 @@ def run_model(name, build_fn, input_size, train_images, train_captions,
     fp32_image = qat_encoder_to_fp32(qat_result["student_image"]).to("cpu").eval()
     fp32_text = qat_result["student_text"].to("cpu").eval()
 
-    return realquant_report(name, fp32_image, proc, eval_images,
+    # realquant_report's embed_* calls run each cos_sim check as ONE
+    # unbatched forward pass -- fine for a small slice, but eval_images
+    # here can be 1000+ (matching train_qat.py's held-out eval set),
+    # which OOMs exactly like the unbatched-full-tensor-forward bug
+    # _batched_image_forward was built to fix elsewhere in this project.
+    # These calls only need enough images for a stable cos_sim estimate,
+    # not the whole eval set.
+    cos_sim_images = eval_images[:min(32, len(eval_images))]
+
+    return realquant_report(name, fp32_image, proc, cos_sim_images,
                             zeroshot_images, zeroshot_labels, fp32_text, tok,
                             input_size, n_calibration)
 
