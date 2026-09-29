@@ -200,6 +200,44 @@ def convert_to_qat(encoder: nn.Module) -> nn.Module:
     return encoder
 
 
+def qat_encoder_to_fp32(qat_encoder: nn.Module) -> nn.Module:
+    """
+    Inverse of convert_to_qat: unwraps QATLinear back to plain nn.Linear
+    and QATMultiheadAttention back to plain nn.MultiheadAttention,
+    carrying over the TRAINED weight values but dropping the fake-quant
+    simulation.
+
+    QAT's fake-quant is a training-time technique only -- it makes the
+    weights become robust to quantization noise, but doesn't itself
+    produce a real quantized (smaller, faster) model; QATLinear.forward
+    always runs the full fp32 matmul under the hood. To get a real
+    int8 model out of QAT, the standard path is: train with fake-quant,
+    then export the resulting (now quantization-adapted) fp32 weights
+    through an ordinary post-training quantizer (quantize_encoder_ptq,
+    or the ONNX static path) -- this function produces the plain fp32
+    model that step needs, reusing all of this project's existing,
+    already-validated real-kernel PTQ infrastructure instead of writing
+    a new one.
+    """
+    encoder = copy.deepcopy(qat_encoder)
+    for name, module in list(encoder.named_modules()):
+        for child_name, child in list(module.named_children()):
+            if isinstance(child, QATLinear):
+                plain = nn.Linear(child.weight.shape[1], child.weight.shape[0],
+                                  bias=child.bias is not None)
+                plain.weight.data = child.weight.data.clone()
+                if child.bias is not None:
+                    plain.bias.data = child.bias.data.clone()
+                setattr(module, child_name, plain)
+            elif isinstance(child, QATMultiheadAttention):
+                # child.mha's out_proj may itself be a QATLinear (wrapped
+                # by convert_to_qat's other branch on a later iteration
+                # of that same loop) -- recurse into it so nothing is
+                # left half-unwrapped.
+                setattr(module, child_name, qat_encoder_to_fp32(child.mha))
+    return encoder
+
+
 def distillation_loss(student_out: torch.Tensor, teacher_out: torch.Tensor) -> torch.Tensor:
     """1 - cosine_similarity, averaged over the batch -- no labels needed,
     the frozen fp32 model's own output is the training target."""
