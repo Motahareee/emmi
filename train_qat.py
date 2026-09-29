@@ -16,12 +16,14 @@ Usage: python3 train_qat.py [--n-train 64] [--n-eval 32] [--epochs 15]
 """
 
 import argparse
+import os
 
 import torch
 from torch.optim import AdamW
 
 from emma.data.coco import _stream_samples
 from emma.model_compression import convert_to_qat, distillation_loss, model_size_mb
+from emma.model_compression.qat import qat_encoder_to_fp32
 from eval_ptq import build_clip, build_mobileclip, _cosine_sim
 from eval_zeroshot_compare import zero_shot_accuracy
 
@@ -66,13 +68,20 @@ def _parse_args():
     p.add_argument("--n-zeroshot", type=int, default=200,
                    help="CIFAR-10 test images for real zero-shot accuracy "
                         "(not just cos_sim vs the model's own fp32 output)")
+    p.add_argument("--save-dir", type=str, default=None,
+                   help="if given, save the QAT-trained weights (unwrapped back to "
+                        "plain fp32 nn.Linear via qat_encoder_to_fp32) as "
+                        "<save-dir>/<name>_qat_image.pt / _text.pt -- train_qat.py "
+                        "never saved anything before this, so real-kernel PTQ export "
+                        "of QAT-trained weights (eval_qat_realquant.py) needs this")
     return p.parse_args()
 
 
 def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
                  train_images, train_captions, eval_images, eval_captions,
                  epochs: int, lr: float, batch_size: int,
-                 zeroshot_images=None, zeroshot_labels=None) -> dict:
+                 zeroshot_images=None, zeroshot_labels=None,
+                 save_dir: str = None) -> dict:
     print(f"\n=== {name} QAT fine-tuning (device={DEVICE}) ===")
     teacher_image = teacher_image.to(DEVICE).eval()
     teacher_text = teacher_text.to(DEVICE).eval()
@@ -160,6 +169,16 @@ def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
         result["zeroshot_accuracy"] = acc
         print(f"  zero-shot CIFAR-10 accuracy (real task accuracy, not cos_sim): {acc:.4f}")
 
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        fp32_image = qat_encoder_to_fp32(student_image)
+        fp32_text = qat_encoder_to_fp32(student_text)
+        img_path = os.path.join(save_dir, f"{name}_qat_image.pt")
+        txt_path = os.path.join(save_dir, f"{name}_qat_text.pt")
+        torch.save(fp32_image.state_dict(), img_path)
+        torch.save(fp32_text.state_dict(), txt_path)
+        print(f"  saved QAT-trained weights (unwrapped to fp32) -> {img_path}, {txt_path}")
+
     return result
 
 
@@ -188,7 +207,8 @@ def main():
     clip_img, clip_txt, clip_proc, clip_tok = build_clip()
     qat_finetune("CLIP", clip_img, clip_txt, clip_proc, clip_tok,
                 train_images, train_captions, eval_images, eval_captions,
-                args.epochs, args.lr, args.batch_size, zeroshot_images, zeroshot_labels)
+                args.epochs, args.lr, args.batch_size, zeroshot_images, zeroshot_labels,
+                save_dir=args.save_dir)
     # Each qat_finetune call holds teacher + student + AdamW momentum/
     # variance buffers in memory (student is fully trainable, unlike PTQ's
     # frozen-encoder scripts) -- free CLIP's before building MobileCLIP's
@@ -201,7 +221,8 @@ def main():
     mc_img, mc_txt, mc_proc, mc_tok = build_mobileclip()
     qat_finetune("MobileCLIP", mc_img, mc_txt, mc_proc, mc_tok,
                 train_images, train_captions, eval_images, eval_captions,
-                args.epochs, args.lr, args.batch_size, zeroshot_images, zeroshot_labels)
+                args.epochs, args.lr, args.batch_size, zeroshot_images, zeroshot_labels,
+                save_dir=args.save_dir)
 
 
 if __name__ == "__main__":
