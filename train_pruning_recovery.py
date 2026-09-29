@@ -54,7 +54,7 @@ from emma.model_compression import (
     prune_clip_vit_mlps, distillation_loss, relational_distillation_loss,
     model_size_mb, compute_taylor_importance,
 )
-from eval_ptq import build_clip, _cosine_sim
+from eval_ptq import build_clip, _cosine_sim, _latency_ms
 from eval_zeroshot_compare import zero_shot_accuracy
 
 
@@ -271,14 +271,34 @@ def main():
     recovered_acc = zero_shot_accuracy(_embed, text_encoder, tok,
                                        zeroshot_images, zeroshot_labels, device=DEVICE)
 
+    # Latency is the project's headline metric (see CLAUDE.md) -- accuracy
+    # and size alone don't answer "is this actually worth deploying."
+    # Measured on CPU (the edge-deployment target), not DEVICE, since
+    # training may have run on a GPU that isn't the actual target
+    # hardware. A small fixed batch (16 images), matching the batch size
+    # eval_ptq.py's own latency benchmark uses.
+    lat_batch = proc(images=eval_images[:16], return_tensors="pt")["pixel_values"].to("cpu")
+    teacher_cpu = teacher_image.to("cpu").eval()
+    pruned_only_cpu = pruned_only.to("cpu").eval()
+    student_cpu = student.to("cpu").eval()
+    with torch.no_grad():
+        lat_fp32 = _latency_ms(lambda: teacher_cpu(lat_batch))
+        lat_no_recovery = _latency_ms(lambda: pruned_only_cpu(lat_batch))
+        lat_recovered = _latency_ms(lambda: student_cpu(lat_batch))
+
     print("\n=== Summary ===")
-    print(f"  size: {model_size_mb(teacher_image):.1f} -> {model_size_mb(student):.1f} MB")
+    size_fp32 = model_size_mb(teacher_image)
+    size_pruned = model_size_mb(student)
+    print(f"  size: {size_fp32:.1f} -> {size_pruned:.1f} MB ({size_fp32/size_pruned:.2f}x)")
     if args.early_stop and best_state is not None:
         print(f"  early-stopped at epoch {best_epoch}/{args.epochs} (best held-out zero-shot acc)")
-    print(f"  {'':25s} {'held-out cos_sim':>18} {'zero-shot acc':>15}")
-    print(f"  {'no recovery':25s} {no_recovery_cos:>18.4f} {no_recovery_acc:>15.4f}")
-    print(f"  {'pruned + recovered':25s} {recovered_cos:>18.4f} {recovered_acc:>15.4f}")
-    print(f"  {'fp32 baseline (for ref)':25s} {'1.0000':>18} {'0.9200':>15}  (from earlier zero-shot comparison)")
+    print(f"  {'':25s} {'held-out cos_sim':>18} {'zero-shot acc':>15} {'latency min (ms)':>18}")
+    print(f"  {'no recovery':25s} {no_recovery_cos:>18.4f} {no_recovery_acc:>15.4f} "
+          f"{lat_no_recovery['min']:>18.1f}")
+    print(f"  {'pruned + recovered':25s} {recovered_cos:>18.4f} {recovered_acc:>15.4f} "
+          f"{lat_recovered['min']:>18.1f}")
+    print(f"  {'fp32 baseline (for ref)':25s} {'1.0000':>18} {'0.9200':>15} {lat_fp32['min']:>18.1f}")
+    print(f"  latency speedup (min, pruned+recovered vs fp32): {lat_fp32['min']/lat_recovered['min']:.2f}x")
 
 
 if __name__ == "__main__":
