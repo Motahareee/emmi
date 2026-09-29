@@ -179,6 +179,8 @@ def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
         torch.save(fp32_text.state_dict(), txt_path)
         print(f"  saved QAT-trained weights (unwrapped to fp32) -> {img_path}, {txt_path}")
 
+    result["student_image"] = student_image
+    result["student_text"] = student_text
     return result
 
 
