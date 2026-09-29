@@ -186,15 +186,24 @@ def main():
     for epoch in range(1, args.epochs + 1):
         student.train()
         epoch_loss, n_batches = 0.0, 0
+        # Finding 24: relational loss's training signal depends on WHICH
+        # other captions share a batch (its negatives), unlike cosine
+        # loss which is per-example -- without this per-epoch shuffle,
+        # the same ~62 fixed batches repeated across all epochs let the
+        # student learn a degenerate solution tailored to that one fixed
+        # negative-pairing structure instead of a genuinely generalizing
+        # one. Shuffled for both losses for a fair, consistent comparison.
+        perm = torch.randperm(n_train, device=DEVICE)
         for start in range(0, n_train, BATCH_SIZE):
             end = start + BATCH_SIZE
+            idx = perm[start:end]
             optimizer.zero_grad()
-            student_out = student(train_pv[start:end])
+            student_out = student(train_pv[idx])
             if args.recovery_loss == "relational":
-                loss = relational_distillation_loss(student_out, teacher_train_out[start:end],
-                                                     train_text_out[start:end])
+                loss = relational_distillation_loss(student_out, teacher_train_out[idx],
+                                                     train_text_out[idx])
             else:
-                loss = distillation_loss(student_out, teacher_train_out[start:end])
+                loss = distillation_loss(student_out, teacher_train_out[idx])
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
