@@ -43,6 +43,7 @@ Usage: python3 train_pruning_recovery.py [--ratio 0.3] [--n-train 128] [--epochs
 """
 
 import argparse
+import copy
 
 import torch
 import torchvision
@@ -103,6 +104,13 @@ def _parse_args():
                    help="if >0, run the full held-out cos_sim + zero-shot accuracy check "
                         "every N epochs (plus the final epoch) to see the trajectory, not "
                         "just the endpoint -- 0 disables (matches prior scripts' behavior)")
+    p.add_argument("--early-stop", action="store_true",
+                   help="requires --eval-every>0. Checkpoints the student whenever a new best "
+                        "held-out zero-shot accuracy is seen, and restores that checkpoint at "
+                        "the end instead of using the final epoch's weights. Finding 26: "
+                        "training loss falls smoothly the whole run and is uncorrelated with "
+                        "accuracy, which peaks mid-training then falls off from overfitting -- "
+                        "the final epoch is reliably NOT the best epoch.")
     return p.parse_args()
 
 
@@ -187,6 +195,7 @@ def main():
 
     BATCH_SIZE = args.batch_size
     n_train = train_pv.size(0)
+    best_acc, best_epoch, best_state = -1.0, None, None
     for epoch in range(1, args.epochs + 1):
         student.train()
         epoch_loss, n_batches = 0.0, 0
@@ -232,22 +241,40 @@ def main():
 
             trk_acc = zero_shot_accuracy(trk_embed, text_encoder, tok,
                                          zeroshot_images, zeroshot_labels, device=DEVICE)
-            print(f"    [epoch {epoch:02d}] held-out cos_sim={trk_cos:.4f}  zero-shot acc={trk_acc:.4f}")
+            is_best = args.early_stop and trk_acc > best_acc
+            print(f"    [epoch {epoch:02d}] held-out cos_sim={trk_cos:.4f}  zero-shot acc={trk_acc:.4f}"
+                  f"{'  (new best)' if is_best else ''}")
+            if is_best:
+                best_acc, best_epoch = trk_acc, epoch
+                best_state = copy.deepcopy(student.state_dict())
             student.train()
+
+    def _embed(imgs):
+        pv = proc(images=imgs, return_tensors="pt")["pixel_values"].to(DEVICE)
+        return student(pv)
+
+    if args.early_stop and best_state is not None:
+        # Finding 26: final-epoch weights are reliably NOT the best epoch --
+        # restore whichever checkpoint scored highest on held-out zero-shot
+        # accuracy instead of just using whatever epoch happened to be last.
+        student.eval()
+        final_epoch_acc = zero_shot_accuracy(_embed, text_encoder, tok,
+                                             zeroshot_images, zeroshot_labels, device=DEVICE)
+        print(f"\nFinal epoch ({args.epochs}) zero-shot acc={final_epoch_acc:.4f} -- "
+              f"restoring best checkpoint instead (epoch {best_epoch}, acc={best_acc:.4f})")
+        student.load_state_dict(best_state)
 
     student.eval()
     student_eval_out = _batched_image_forward(student, eval_pv, args.batch_size)
     recovered_cos = _cosine_sim(teacher_eval_out, student_eval_out)
 
-    def student_embed(imgs):
-        pv = proc(images=imgs, return_tensors="pt")["pixel_values"].to(DEVICE)
-        return student(pv)
-
-    recovered_acc = zero_shot_accuracy(student_embed, text_encoder, tok,
+    recovered_acc = zero_shot_accuracy(_embed, text_encoder, tok,
                                        zeroshot_images, zeroshot_labels, device=DEVICE)
 
     print("\n=== Summary ===")
     print(f"  size: {model_size_mb(teacher_image):.1f} -> {model_size_mb(student):.1f} MB")
+    if args.early_stop and best_state is not None:
+        print(f"  early-stopped at epoch {best_epoch}/{args.epochs} (best held-out zero-shot acc)")
     print(f"  {'':25s} {'held-out cos_sim':>18} {'zero-shot acc':>15}")
     print(f"  {'no recovery':25s} {no_recovery_cos:>18.4f} {no_recovery_acc:>15.4f}")
     print(f"  {'pruned + recovered':25s} {recovered_cos:>18.4f} {recovered_acc:>15.4f}")
