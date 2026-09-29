@@ -51,4 +51,14 @@ _stream_samples(5000, offset=0)
 print('COCO samples cached.')
 "
 
+echo "=== Pre-fetching larger COCO set for the information-theoretic capacity test ==="
+python3 -c "
+from emma.data.coco import _stream_samples
+# train_pruning_recovery_scale.sh -- n_train=12000/n_eval=1500, testing whether
+# the ~50-64% pruning-recovery accuracy ceiling is a training-budget artifact
+# or intrinsic to the pruned model's remaining capacity.
+_stream_samples(13500, offset=0)
+print('Large-scale COCO samples cached.')
+"
+
 echo "Done: $(date)"
