@@ -204,3 +204,51 @@ def distillation_loss(student_out: torch.Tensor, teacher_out: torch.Tensor) -> t
     """1 - cosine_similarity, averaged over the batch -- no labels needed,
     the frozen fp32 model's own output is the training target."""
     return (1 - nn.functional.cosine_similarity(student_out, teacher_out, dim=-1)).mean()
+
+
+def relational_distillation_loss(student_image_embeds: torch.Tensor,
+                                 teacher_image_embeds: torch.Tensor,
+                                 text_embeds: torch.Tensor,
+                                 temperature: float = 100.0) -> torch.Tensor:
+    """
+    Relational/contrastive distillation -- an alternative to
+    distillation_loss above, motivated by three independent negative
+    results (more epochs, iterative pruning, Taylor importance) all
+    failing to move pruning-recovery's ~50-64% accuracy ceiling while
+    using plain feature distillation.
+
+    distillation_loss trains the student's embedding to sit close to the
+    teacher's in absolute direction -- but zero-shot classification only
+    depends on RELATIVE ranking (is this image more similar to "a photo
+    of a cat" or "a photo of a dog"), which cosine-similarity-to-teacher
+    doesn't directly constrain: two embeddings can agree closely in
+    direction yet disagree on which of several text prompts they're
+    closest to.
+
+    This loss instead makes the student reproduce the same softmax
+    similarity distribution over in-batch text embeddings that the
+    teacher produces (symmetric KL divergence, both image-to-text and
+    text-to-image, matching the reduction CLIP's own contrastive
+    training loss uses) -- structurally identical to what zero-shot
+    inference actually computes, rather than a proxy for it.
+
+    text_embeds are the FROZEN text encoder's output, shared by both
+    teacher and student logits -- only the image encoder is being
+    pruned/recovered in this project's pipeline, so holding text fixed
+    isolates the image encoder's relative-similarity structure instead of
+    conflating it with any text-side drift.
+    """
+    img_s = student_image_embeds / student_image_embeds.norm(dim=-1, keepdim=True)
+    img_t = teacher_image_embeds / teacher_image_embeds.norm(dim=-1, keepdim=True)
+    txt = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+
+    teacher_logits = img_t @ txt.T * temperature
+    student_logits = img_s @ txt.T * temperature
+
+    loss_i2t = nn.functional.kl_div(nn.functional.log_softmax(student_logits, dim=-1),
+                                    nn.functional.softmax(teacher_logits, dim=-1),
+                                    reduction="batchmean")
+    loss_t2i = nn.functional.kl_div(nn.functional.log_softmax(student_logits.T, dim=-1),
+                                    nn.functional.softmax(teacher_logits.T, dim=-1),
+                                    reduction="batchmean")
+    return (loss_i2t + loss_t2i) / 2

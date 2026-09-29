@@ -5,7 +5,7 @@ from .onnx_static import (
     summarize_onnx_graph, build_ort_session,
 )
 from .sensitivity import get_quantizable_nodes, sweep_node_sensitivity
-from .qat import QATLinear, convert_to_qat, distillation_loss
+from .qat import QATLinear, convert_to_qat, distillation_loss, relational_distillation_loss
 from .pruning import (
     compute_channel_importance, compute_taylor_importance,
     prune_mlp_pair, prune_clip_vit_mlps,
@@ -18,7 +18,7 @@ __all__ = [
     "export_image_encoder_to_onnx", "ImageCalibrationReader", "quantize_onnx_static",
     "summarize_onnx_graph", "build_ort_session",
     "get_quantizable_nodes", "sweep_node_sensitivity",
-    "QATLinear", "convert_to_qat", "distillation_loss",
+    "QATLinear", "convert_to_qat", "distillation_loss", "relational_distillation_loss",
     "compute_channel_importance", "compute_taylor_importance",
     "prune_mlp_pair", "prune_clip_vit_mlps",
     "compute_conv_channel_importance", "prune_conv_mlp_pair", "prune_mobileclip_mlps",

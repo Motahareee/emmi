@@ -27,9 +27,19 @@ criterion itself as the next candidate. L2-magnitude only looks at weight
 size; Taylor importance (compute_taylor_importance) looks at each
 channel's actual effect on CLIP's own contrastive loss via one
 forward+backward pass on a calibration batch -- the standard stronger
-alternative in the pruning literature.
+alternative in the pruning literature. (Finding 22: this ALSO didn't move
+the ceiling -- three negative results now, epochs/scheduling/criterion.)
 
-Usage: python3 train_pruning_recovery.py [--ratio 0.3] [--n-train 128] [--epochs 20] [--criterion taylor]
+--recovery-loss relational (Finding 22 follow-up): the recovery objective
+itself is the remaining candidate. distillation_loss (cosine similarity to
+the teacher's embedding) optimizes absolute embedding direction, not the
+relative-ranking property zero-shot classification actually depends on.
+relational_distillation_loss instead matches the teacher's and student's
+softmax similarity distributions over in-batch (image, caption) pairs --
+structurally identical to CLIP's own contrastive training objective and to
+what zero-shot inference computes, rather than a proxy for it.
+
+Usage: python3 train_pruning_recovery.py [--ratio 0.3] [--n-train 128] [--epochs 20] [--criterion taylor] [--recovery-loss relational]
 """
 
 import argparse
@@ -40,7 +50,8 @@ from torch.optim import AdamW
 
 from emma.data.coco import _stream_samples
 from emma.model_compression import (
-    prune_clip_vit_mlps, distillation_loss, model_size_mb, compute_taylor_importance,
+    prune_clip_vit_mlps, distillation_loss, relational_distillation_loss,
+    model_size_mb, compute_taylor_importance,
 )
 from eval_ptq import build_clip, _cosine_sim
 from eval_zeroshot_compare import zero_shot_accuracy
@@ -54,6 +65,15 @@ def _batched_image_forward(model, pv, batch_size):
     """Same fix as train_qat.py -- a full-tensor forward was fine at
     n_train=128 (CPU) but OOMs on GPU at real scale (n_train=4000+)."""
     outs = [model(pv[i:i + batch_size]) for i in range(0, pv.size(0), batch_size)]
+    return torch.cat(outs, dim=0)
+
+
+@torch.no_grad()
+def _batched_text_forward(model, txt, batch_size):
+    n = txt["input_ids"].size(0)
+    outs = [model(input_ids=txt["input_ids"][i:i + batch_size],
+                  attention_mask=txt["attention_mask"][i:i + batch_size])
+           for i in range(0, n, batch_size)]
     return torch.cat(outs, dim=0)
 
 
@@ -75,6 +95,10 @@ def _parse_args():
     p.add_argument("--n-calib", type=int, default=64,
                    help="calibration batch size for --criterion taylor "
                         "(a subset of the training images/captions)")
+    p.add_argument("--recovery-loss", choices=["cosine", "relational"], default="cosine",
+                   help="relational matches teacher/student similarity distributions over "
+                        "in-batch (image, caption) pairs instead of raw embedding "
+                        "cosine-similarity (see relational_distillation_loss)")
     return p.parse_args()
 
 
@@ -112,6 +136,13 @@ def main():
 
     teacher_train_out = _batched_image_forward(teacher_image, train_pv, args.batch_size)
     teacher_eval_out = _batched_image_forward(teacher_image, eval_pv, args.batch_size)
+
+    train_text_out = None
+    if args.recovery_loss == "relational":
+        train_txt = tok(train_captions, max_length=32, padding="max_length",
+                        truncation=True, return_tensors="pt")
+        train_txt = {k: v.to(DEVICE) for k, v in train_txt.items()}
+        train_text_out = _batched_text_forward(text_encoder, train_txt, args.batch_size)
 
     importances = None
     if args.criterion == "taylor":
@@ -159,14 +190,18 @@ def main():
             end = start + BATCH_SIZE
             optimizer.zero_grad()
             student_out = student(train_pv[start:end])
-            loss = distillation_loss(student_out, teacher_train_out[start:end])
+            if args.recovery_loss == "relational":
+                loss = relational_distillation_loss(student_out, teacher_train_out[start:end],
+                                                     train_text_out[start:end])
+            else:
+                loss = distillation_loss(student_out, teacher_train_out[start:end])
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
             n_batches += 1
 
         if epoch % 5 == 0 or epoch == 1:
-            print(f"  epoch {epoch:02d}/{args.epochs}  distillation loss={epoch_loss / n_batches:.4f}")
+            print(f"  epoch {epoch:02d}/{args.epochs}  {args.recovery_loss} loss={epoch_loss / n_batches:.4f}")
 
     student.eval()
     student_eval_out = _batched_image_forward(student, eval_pv, args.batch_size)
