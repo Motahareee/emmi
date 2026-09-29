@@ -61,6 +61,14 @@ def _parse_args():
                    help="calibration images for the ONNX static-quant path")
     p.add_argument("--models", type=str, default="clip,mobileclip",
                    help="comma-separated subset of clip,mobileclip to run")
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="track zero-shot accuracy during QAT training every N epochs -- "
+                        "see train_qat.py's identical flag (Finding 23/26 follow-up)")
+    p.add_argument("--early-stop", action="store_true",
+                   help="checkpoint QAT training on best zero-shot accuracy instead of "
+                        "final epoch, then real-quantize THAT checkpoint -- tests whether "
+                        "MobileCLIP QAT's gap (Finding 23) was partly a training-budget "
+                        "artifact, the same way pruning-recovery's was (Finding 26)")
     return p.parse_args()
 
 
@@ -135,11 +143,12 @@ def realquant_report(name: str, fp32_image, proc, calib_images,
 
 def run_model(name, build_fn, input_size, train_images, train_captions,
              eval_images, eval_captions, zeroshot_images, zeroshot_labels,
-             epochs, lr, batch_size, n_calibration):
+             epochs, lr, batch_size, n_calibration, eval_every=0, early_stop=False):
     teacher_image, teacher_text, proc, tok = build_fn()
     qat_result = qat_finetune(name, teacher_image, teacher_text, proc, tok,
                               train_images, train_captions, eval_images, eval_captions,
-                              epochs, lr, batch_size, zeroshot_images, zeroshot_labels)
+                              epochs, lr, batch_size, zeroshot_images, zeroshot_labels,
+                              eval_every=eval_every, early_stop=early_stop)
     # Real quantization (dynamic PTQ's int8 CPU kernels, and this
     # project's whole PTQ/ONNX pipeline) targets CPU deployment, same as
     # every other PTQ script here -- move off DEVICE (cuda during
@@ -184,12 +193,14 @@ def main():
         all_results["CLIP"] = run_model("CLIP", build_clip, 224,
                                         train_images, train_captions, eval_images, eval_captions,
                                         zeroshot_images, zeroshot_labels,
-                                        args.epochs, args.lr, args.batch_size, args.n_calibration)
+                                        args.epochs, args.lr, args.batch_size, args.n_calibration,
+                                        eval_every=args.eval_every, early_stop=args.early_stop)
     if "mobileclip" in models:
         all_results["MobileCLIP"] = run_model("MobileCLIP", build_mobileclip, 256,
                                               train_images, train_captions, eval_images, eval_captions,
                                               zeroshot_images, zeroshot_labels,
-                                              args.epochs, args.lr, args.batch_size, args.n_calibration)
+                                              args.epochs, args.lr, args.batch_size, args.n_calibration,
+                                              eval_every=args.eval_every, early_stop=args.early_stop)
 
     print("\n=== Summary: real-kernel quantization of QAT-trained weights ===")
     for name, r in all_results.items():

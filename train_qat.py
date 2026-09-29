@@ -16,6 +16,7 @@ Usage: python3 train_qat.py [--n-train 64] [--n-eval 32] [--epochs 15]
 """
 
 import argparse
+import copy
 import os
 
 import torch
@@ -74,6 +75,16 @@ def _parse_args():
                         "<save-dir>/<name>_qat_image.pt / _text.pt -- train_qat.py "
                         "never saved anything before this, so real-kernel PTQ export "
                         "of QAT-trained weights (eval_qat_realquant.py) needs this")
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="if >0, track zero-shot accuracy every N epochs (plus the final "
+                        "epoch) instead of only at the end -- see train_pruning_recovery.py's "
+                        "identical flag/rationale (Finding 26)")
+    p.add_argument("--early-stop", action="store_true",
+                   help="requires --eval-every>0. Checkpoints student_image/student_text "
+                        "whenever a new best zero-shot accuracy is seen, and restores that "
+                        "checkpoint at the end instead of the final epoch's weights -- tests "
+                        "whether MobileCLIP QAT's Finding 23 overfitting is fixed the same "
+                        "way pruning-recovery's was (Finding 26)")
     return p.parse_args()
 
 
@@ -81,7 +92,7 @@ def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
                  train_images, train_captions, eval_images, eval_captions,
                  epochs: int, lr: float, batch_size: int,
                  zeroshot_images=None, zeroshot_labels=None,
-                 save_dir: str = None) -> dict:
+                 save_dir: str = None, eval_every: int = 0, early_stop: bool = False) -> dict:
     print(f"\n=== {name} QAT fine-tuning (device={DEVICE}) ===")
     teacher_image = teacher_image.to(DEVICE).eval()
     teacher_text = teacher_text.to(DEVICE).eval()
@@ -122,21 +133,31 @@ def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
     teacher_img_out = _batched_image_forward(teacher_image, train_pv, BATCH_SIZE)
     teacher_txt_out = _batched_text_forward(teacher_text, train_txt, BATCH_SIZE)
 
+    best_acc, best_epoch = -1.0, None
+    best_state_image, best_state_text = None, None
     for epoch in range(1, epochs + 1):
         student_image.train()
         student_text.train()
         epoch_loss = 0.0
         n_batches = 0
 
+        # Same fix as train_pruning_recovery.py's Finding 24/26: without
+        # per-epoch shuffling, the same fixed batches repeat every epoch;
+        # with it, gradient noise differs run to run, which is why exact
+        # trajectories won't reproduce the way the pruning-recovery ones
+        # did (that script's shuffle was added later, for a different
+        # reason -- kept here from the start for the same fairness logic).
+        perm = torch.randperm(n_train, device=DEVICE)
         for start in range(0, n_train, BATCH_SIZE):
             end = start + BATCH_SIZE
+            idx = perm[start:end]
             optimizer.zero_grad()
 
-            student_img_out = student_image(train_pv[start:end])
-            student_txt_out = student_text(input_ids=train_txt["input_ids"][start:end],
-                                           attention_mask=train_txt["attention_mask"][start:end])
-            loss = (distillation_loss(student_img_out, teacher_img_out[start:end]) +
-                   distillation_loss(student_txt_out, teacher_txt_out[start:end]))
+            student_img_out = student_image(train_pv[idx])
+            student_txt_out = student_text(input_ids=train_txt["input_ids"][idx],
+                                           attention_mask=train_txt["attention_mask"][idx])
+            loss = (distillation_loss(student_img_out, teacher_img_out[idx]) +
+                   distillation_loss(student_txt_out, teacher_txt_out[idx]))
             loss.backward()
             optimizer.step()
 
@@ -145,6 +166,37 @@ def qat_finetune(name: str, teacher_image, teacher_text, proc, tok,
 
         if epoch % 5 == 0 or epoch == 1:
             print(f"  epoch {epoch:02d}/{epochs}  distillation loss={epoch_loss / n_batches:.4f}")
+
+        if eval_every and zeroshot_images is not None and (epoch % eval_every == 0 or epoch == epochs):
+            # Finding 23 follow-up: MobileCLIP QAT's 43.45% (vs CLIP's
+            # 74.15%) was root-caused to "training actively hurts" -- the
+            # same overfitting signature Finding 18/26 found in pruning-
+            # recovery. This tests whether early stopping recovers the
+            # same kind of gains here that it did there.
+            student_image.eval()
+            student_text.eval()
+
+            def trk_embed(imgs):
+                pv = proc(images=imgs, return_tensors="pt")["pixel_values"].to(DEVICE)
+                return student_image(pv)
+
+            trk_acc = zero_shot_accuracy(trk_embed, student_text, tok,
+                                         zeroshot_images, zeroshot_labels, device=DEVICE)
+            is_best = early_stop and trk_acc > best_acc
+            print(f"    [epoch {epoch:02d}] zero-shot acc={trk_acc:.4f}"
+                  f"{'  (new best)' if is_best else ''}")
+            if is_best:
+                best_acc, best_epoch = trk_acc, epoch
+                best_state_image = copy.deepcopy(student_image.state_dict())
+                best_state_text = copy.deepcopy(student_text.state_dict())
+            student_image.train()
+            student_text.train()
+
+    if early_stop and best_state_image is not None:
+        print(f"  restoring best checkpoint (epoch {best_epoch}, zero-shot acc={best_acc:.4f}) "
+              f"instead of final epoch {epochs}")
+        student_image.load_state_dict(best_state_image)
+        student_text.load_state_dict(best_state_text)
 
     student_image.eval()
     student_text.eval()
@@ -210,7 +262,7 @@ def main():
     qat_finetune("CLIP", clip_img, clip_txt, clip_proc, clip_tok,
                 train_images, train_captions, eval_images, eval_captions,
                 args.epochs, args.lr, args.batch_size, zeroshot_images, zeroshot_labels,
-                save_dir=args.save_dir)
+                save_dir=args.save_dir, eval_every=args.eval_every, early_stop=args.early_stop)
     # Each qat_finetune call holds teacher + student + AdamW momentum/
     # variance buffers in memory (student is fully trainable, unlike PTQ's
     # frozen-encoder scripts) -- free CLIP's before building MobileCLIP's
@@ -224,7 +276,7 @@ def main():
     qat_finetune("MobileCLIP", mc_img, mc_txt, mc_proc, mc_tok,
                 train_images, train_captions, eval_images, eval_captions,
                 args.epochs, args.lr, args.batch_size, zeroshot_images, zeroshot_labels,
-                save_dir=args.save_dir)
+                save_dir=args.save_dir, eval_every=args.eval_every, early_stop=args.early_stop)
 
 
 if __name__ == "__main__":
