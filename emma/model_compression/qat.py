@@ -31,6 +31,7 @@ text-encoder export bug that limited eval_onnx_ptq.py to image encoders
 only. Both towers can be QAT-fine-tuned here.
 """
 
+import contextlib
 import copy
 
 import torch
@@ -40,6 +41,26 @@ import torch.nn as nn
 def _ste_round(x: torch.Tensor) -> torch.Tensor:
     """Straight-through round: round() forward, identity gradient backward."""
     return x + (torch.round(x) - x).detach()
+
+
+def _fake_quant_weight_per_row(w: torch.Tensor) -> torch.Tensor:
+    """
+    Per-output-channel (per-row) scale/zero-point -- shared by QATLinear
+    and QATMultiheadAttention below, since both fake-quantize a 2D weight
+    matrix where each row is one output channel/filter. Same fix that
+    took PTQ's CLIP accuracy from 0.835 to 0.946 (per-tensor forces every
+    channel to share one scale calibrated to the widest range in the
+    whole tensor).
+    """
+    w_min = w.min(dim=1, keepdim=True).values
+    w_max = w.max(dim=1, keepdim=True).values
+    w_min = torch.minimum(w_min, torch.zeros_like(w_min))
+    w_max = torch.maximum(w_max, torch.zeros_like(w_max))
+    scale = torch.clamp((w_max - w_min) / 255.0, min=1e-8)
+    zero_point = _ste_round(-128 - w_min / scale)
+    zero_point = torch.clamp(zero_point, -128, 127)
+    q = torch.clamp(_ste_round(w / scale) + zero_point, -128, 127)
+    return (q - zero_point) * scale
 
 
 class QATLinear(nn.Module):
@@ -67,22 +88,7 @@ class QATLinear(nn.Module):
         self.register_buffer("_observed", torch.tensor(False))
 
     def _fake_quant_weight(self, w: torch.Tensor) -> torch.Tensor:
-        """
-        Per-output-channel (per-row) scale/zero-point -- nn.Linear's
-        weight is [out_features, in_features], so each row is one output
-        channel/filter. Same fix that took PTQ's CLIP accuracy from 0.835
-        to 0.946 (per-tensor forces every channel to share one scale
-        calibrated to the widest range in the whole tensor).
-        """
-        w_min = w.min(dim=1, keepdim=True).values
-        w_max = w.max(dim=1, keepdim=True).values
-        w_min = torch.minimum(w_min, torch.zeros_like(w_min))
-        w_max = torch.maximum(w_max, torch.zeros_like(w_max))
-        scale = torch.clamp((w_max - w_min) / 255.0, min=1e-8)
-        zero_point = _ste_round(-128 - w_min / scale)
-        zero_point = torch.clamp(zero_point, -128, 127)
-        q = torch.clamp(_ste_round(w / scale) + zero_point, -128, 127)
-        return (q - zero_point) * scale
+        return _fake_quant_weight_per_row(w)
 
     def _fake_quant_activation(self, x: torch.Tensor) -> torch.Tensor:
         if self.training:
@@ -104,6 +110,63 @@ class QATLinear(nn.Module):
         x_q = self._fake_quant_activation(x)
         w_q = self._fake_quant_weight(self.weight)
         return nn.functional.linear(x_q, w_q, self.bias)
+
+
+@contextlib.contextmanager
+def _swapped_parameter(module: nn.Module, name: str, replacement: torch.Tensor):
+    """
+    Temporarily makes `module.name` resolve to `replacement` (a computed,
+    non-leaf tensor -- e.g. a fake-quantized copy) instead of the real
+    nn.Parameter, then restores the original afterward. nn.Module's
+    __setattr__ refuses to assign a plain Tensor over a registered
+    Parameter, so this bypasses it via object.__setattr__, which writes
+    straight into the instance __dict__ -- normal attribute lookup finds
+    that before ever falling through to nn.Module.__getattr__'s Parameter
+    lookup, so module.forward() sees `replacement` with zero changes to
+    its own code.
+    """
+    original = module._parameters.pop(name)
+    object.__setattr__(module, name, replacement)
+    try:
+        yield
+    finally:
+        del module.__dict__[name]
+        module._parameters[name] = original
+
+
+class QATMultiheadAttention(nn.Module):
+    """
+    Wraps nn.MultiheadAttention to fake-quantize in_proj_weight (the
+    fused Q/K/V projection) during QAT.
+
+    convert_to_qat's isinstance(child, nn.Linear) check misses this
+    entirely: in_proj_weight is a raw Parameter sitting directly on the
+    MultiheadAttention module, not a Linear submodule, so it silently
+    stayed fp32 through QAT fine-tuning with no fake-quant noise at all.
+    On MobileCLIP's image encoder this is ~12.6% of parameters (9.46M) --
+    CLIP's HF attention implements Q/K/V/out as four separate nn.Linear
+    layers instead, which convert_to_qat already catches, so this gap is
+    specific to MobileCLIP's timm-based attention and is a real candidate
+    for its QAT accuracy gap vs CLIP (43.45% vs 74.15%).
+
+    out_proj is a NonDynamicallyQuantizableLinear (an nn.Linear subclass)
+    -- convert_to_qat's existing Linear branch already replaces it
+    in-place on the wrapped `mha` object, so this class only needs to
+    handle in_proj_weight. in_proj_bias is left fp32, matching QATLinear's
+    existing convention of only fake-quantizing weights, not biases.
+    """
+
+    def __init__(self, mha: nn.MultiheadAttention):
+        super().__init__()
+        self.mha = mha
+        self.mha.in_proj_weight.requires_grad_(True)
+        if self.mha.in_proj_bias is not None:
+            self.mha.in_proj_bias.requires_grad_(True)
+
+    def forward(self, *args, **kwargs):
+        fake_q_weight = _fake_quant_weight_per_row(self.mha.in_proj_weight)
+        with _swapped_parameter(self.mha, "in_proj_weight", fake_q_weight):
+            return self.mha(*args, **kwargs)
 
 
 def convert_to_qat(encoder: nn.Module) -> nn.Module:
@@ -128,6 +191,12 @@ def convert_to_qat(encoder: nn.Module) -> nn.Module:
                 if qat_linear.bias is not None:
                     qat_linear.bias.requires_grad_(True)
                 setattr(module, child_name, qat_linear)
+            elif isinstance(child, nn.MultiheadAttention):
+                # out_proj (a Linear subclass) is caught by the branch
+                # above when this same loop later visits `child` itself
+                # as `module` -- this branch only needs to cover
+                # in_proj_weight, which isinstance(nn.Linear) can't see.
+                setattr(module, child_name, QATMultiheadAttention(child))
     return encoder
 
 
