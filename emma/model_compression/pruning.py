@@ -150,6 +150,75 @@ def prune_mlp_pair(fc1: nn.Linear, fc2: nn.Linear, prune_ratio: float,
     return new_fc1, new_fc2
 
 
+def compute_conv_channel_importance(fc1: nn.Conv2d, criterion: str = "l2") -> torch.Tensor:
+    """
+    Conv2d analogue of compute_channel_importance -- fc1.weight is
+    [out_channels, in_channels, kh, kw] instead of Linear's 2D
+    [out_features, in_features], so importance reduces over dims (1,2,3)
+    instead of dim=1. For MobileCLIP's ConvMlp, fc1/fc2 are 1x1 convs
+    (kh=kw=1), so this is numerically identical to the Linear case --
+    kept as a separate function only because the tensor shape differs.
+    """
+    flat = fc1.weight.data.flatten(1)  # [out_channels, in_channels*kh*kw]
+    if criterion == "l2":
+        return flat.norm(dim=1)
+    elif criterion == "l1":
+        return flat.abs().sum(dim=1)
+    raise ValueError(f"unknown criterion: {criterion!r}")
+
+
+def prune_conv_mlp_pair(fc1: nn.Conv2d, fc2: nn.Conv2d, prune_ratio: float,
+                        criterion: str = "l2", importance: torch.Tensor = None) -> tuple:
+    """
+    Conv2d analogue of prune_mlp_pair -- removes the lowest-importance
+    prune_ratio fraction of fc1's output channels/filters (and the
+    matching fc2 input channels). MobileCLIP's ConvMlp.fc1/fc2 are 1x1
+    convs, so this is structurally the same operation as the Linear
+    case, just indexing dim 0 (out_channels) and dim 1 (in_channels) of a
+    4D weight tensor instead of a 2D one.
+    """
+    if importance is None:
+        importance = compute_conv_channel_importance(fc1, criterion)
+    n_keep = max(1, int(round(fc1.out_channels * (1 - prune_ratio))))
+    keep_idx = importance.topk(n_keep).indices.sort().values
+
+    new_fc1 = nn.Conv2d(fc1.in_channels, n_keep, kernel_size=fc1.kernel_size,
+                        stride=fc1.stride, padding=fc1.padding, bias=fc1.bias is not None)
+    new_fc1.weight.data = fc1.weight.data[keep_idx].clone()
+    if fc1.bias is not None:
+        new_fc1.bias.data = fc1.bias.data[keep_idx].clone()
+
+    new_fc2 = nn.Conv2d(n_keep, fc2.out_channels, kernel_size=fc2.kernel_size,
+                        stride=fc2.stride, padding=fc2.padding, bias=fc2.bias is not None)
+    new_fc2.weight.data = fc2.weight.data[:, keep_idx].clone()
+    if fc2.bias is not None:
+        new_fc2.bias.data = fc2.bias.data.clone()  # fc2's output width is untouched
+
+    return new_fc1, new_fc2
+
+
+def prune_mobileclip_mlps(image_encoder: nn.Module, prune_ratio: float,
+                          criterion: str = "l2") -> nn.Module:
+    """
+    Applies prune_conv_mlp_pair to every FastViT block's ConvMlp
+    (block.mlp.fc1/fc2) across all 4 stages of MobileCLIP's image
+    trunk (mc_img.model.visual.trunk.stages[*].blocks[*]) -- both
+    RepMixerBlock (stages 0-2) and AttentionBlock (stage 3) have this
+    same mlp.fc1/fc2 structure. mlp.conv (a depthwise conv that runs
+    BEFORE fc1, at the block's original channel width) is untouched --
+    it doesn't depend on fc1/fc2's hidden width, same "purely internal"
+    safety property as CLIP's MLP intermediate dimension.
+    """
+    encoder = copy.deepcopy(image_encoder)
+    for stage in encoder.model.visual.trunk.stages:
+        for block in stage.blocks:
+            new_fc1, new_fc2 = prune_conv_mlp_pair(block.mlp.fc1, block.mlp.fc2,
+                                                   prune_ratio, criterion)
+            block.mlp.fc1 = new_fc1
+            block.mlp.fc2 = new_fc2
+    return encoder
+
+
 def prune_clip_vit_mlps(image_encoder: nn.Module, prune_ratio: float,
                         criterion: str = "l2", importances: list = None) -> nn.Module:
     """

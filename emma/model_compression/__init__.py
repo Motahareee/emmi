@@ -9,6 +9,7 @@ from .qat import QATLinear, convert_to_qat, distillation_loss
 from .pruning import (
     compute_channel_importance, compute_taylor_importance,
     prune_mlp_pair, prune_clip_vit_mlps,
+    compute_conv_channel_importance, prune_conv_mlp_pair, prune_mobileclip_mlps,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "QATLinear", "convert_to_qat", "distillation_loss",
     "compute_channel_importance", "compute_taylor_importance",
     "prune_mlp_pair", "prune_clip_vit_mlps",
+    "compute_conv_channel_importance", "prune_conv_mlp_pair", "prune_mobileclip_mlps",
 ]
