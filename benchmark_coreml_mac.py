@@ -49,7 +49,16 @@ def _latency_ms(fn, n_repeats, n_warmup):
     return {"mean": mean, "min": min(times), "max": max(times)}
 
 
-def convert_and_benchmark(name: str, image_encoder, pixel_values, n_repeats, n_warmup) -> dict:
+def convert_and_benchmark(name: str, image_encoder, pixel_values, n_repeats, n_warmup,
+                          size_module=None) -> dict:
+    """
+    size_module: pass a different module to compute fp32 size from if
+    image_encoder's own size is inflated by an unused shared backbone --
+    MobileCLIP's wrapper holds the full shared text+image model
+    (mc_img.model.visual is the actual visual-only size, ~43.7MB vs the
+    ~286MB the whole wrapper reports). Doesn't affect the latency
+    benchmark, which already only exercises the real image forward path.
+    """
     print(f"\n--- {name}: tracing + converting to Core ML ---")
     image_encoder.eval()
     traced = torch.jit.trace(image_encoder, pixel_values)
@@ -63,7 +72,7 @@ def convert_and_benchmark(name: str, image_encoder, pixel_values, n_repeats, n_w
 
     np_input = {"pixel_values": pixel_values.numpy()}
     lat = _latency_ms(lambda: mlmodel.predict(np_input), n_repeats, n_warmup)
-    size_fp32 = model_size_mb(image_encoder)
+    size_fp32 = model_size_mb(size_module if size_module is not None else image_encoder)
 
     print(f"  fp32 PyTorch size: {size_fp32:.1f} MB")
     print(f"  Core ML (compute_units=ALL) latency mean/min: {lat['mean']:.2f}/{lat['min']:.2f} ms "
@@ -85,7 +94,8 @@ def main():
     mc_pv = mc_proc(images=[__import__("PIL.Image", fromlist=["Image"]).new("RGB", (256, 256))],
                     return_tensors="pt")["pixel_values"]
     mc_result = convert_and_benchmark("MobileCLIP-S0", mc_img, mc_pv,
-                                      args.n_repeats, args.n_warmup)
+                                      args.n_repeats, args.n_warmup,
+                                      size_module=mc_img.model.visual)
 
     print("\n=== Summary: Core ML (real Apple Neural Engine path) on this Mac ===")
     print(f"  CLIP ViT-B/32:   {clip_result['size_mb']:.1f} MB, "
