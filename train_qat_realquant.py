@@ -173,6 +173,15 @@ def run_model(name, build_fn, input_size, train_images, train_captions,
 def main():
     args = _parse_args()
     torch.manual_seed(0)
+    # Real-kernel quantization/latency measurement always runs on CPU
+    # (the actual edge-deployment target), even when QAT training ran on
+    # GPU -- unlike train_pruning_recovery.py's `if DEVICE == "cpu"`
+    # guard, this needs to be unconditional, since DEVICE reflects the
+    # training device, not the measurement device. Matches this
+    # project's existing torch.set_num_threads(4) convention
+    # (eval_ptq.py) and avoids the same cgroup-vs-visible-cores
+    # oversubscription that hit the ONNX path (see build_ort_session).
+    torch.set_num_threads(4)
     models = [m.strip() for m in args.models.split(",")]
 
     n_total = args.n_train + args.n_eval

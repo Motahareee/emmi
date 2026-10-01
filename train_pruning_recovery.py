@@ -117,8 +117,12 @@ def _parse_args():
 def main():
     args = _parse_args()
     torch.manual_seed(0)
-    if DEVICE == "cpu":
-        torch.set_num_threads(4)
+    # The final latency measurement always runs on CPU (the actual
+    # edge-deployment target), even when DEVICE is cuda for training --
+    # this needs to be unconditional, not gated on DEVICE, or cluster
+    # runs hit the same thread oversubscription that corrupted
+    # train_qat_realquant.py's ONNX latency numbers (see build_ort_session).
+    torch.set_num_threads(4)
     print(f"Using device: {DEVICE}")
 
     n_total = args.n_train + args.n_eval

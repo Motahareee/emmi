@@ -65,8 +65,8 @@ def _parse_args():
 def main():
     args = _parse_args()
     torch.manual_seed(0)
-    if DEVICE == "cpu":
-        torch.set_num_threads(4)
+    # Unconditional -- see train_pruning_recovery.py's identical fix.
+    torch.set_num_threads(4)
     print(f"Using device: {DEVICE}")
 
     n_total = args.n_train + args.n_eval
