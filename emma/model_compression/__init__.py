@@ -7,8 +7,8 @@ from .onnx_static import (
 from .sensitivity import get_quantizable_nodes, sweep_node_sensitivity
 from .qat import QATLinear, convert_to_qat, distillation_loss, relational_distillation_loss
 from .pruning import (
-    compute_channel_importance, compute_taylor_importance,
-    prune_mlp_pair, prune_clip_vit_mlps,
+    compute_channel_importance, compute_taylor_importance, compute_hessian_importance,
+    compute_global_keep_indices, prune_mlp_pair, prune_clip_vit_mlps,
     compute_conv_channel_importance, prune_conv_mlp_pair, prune_mobileclip_mlps,
 )
 
@@ -19,7 +19,7 @@ __all__ = [
     "summarize_onnx_graph", "build_ort_session",
     "get_quantizable_nodes", "sweep_node_sensitivity",
     "QATLinear", "convert_to_qat", "distillation_loss", "relational_distillation_loss",
-    "compute_channel_importance", "compute_taylor_importance",
-    "prune_mlp_pair", "prune_clip_vit_mlps",
+    "compute_channel_importance", "compute_taylor_importance", "compute_hessian_importance",
+    "compute_global_keep_indices", "prune_mlp_pair", "prune_clip_vit_mlps",
     "compute_conv_channel_importance", "prune_conv_mlp_pair", "prune_mobileclip_mlps",
 ]

@@ -39,7 +39,20 @@ softmax similarity distributions over in-batch (image, caption) pairs --
 structurally identical to CLIP's own contrastive training objective and to
 what zero-shot inference computes, rather than a proxy for it.
 
-Usage: python3 train_pruning_recovery.py [--ratio 0.3] [--n-train 128] [--epochs 20] [--criterion taylor] [--recovery-loss relational]
+--criterion hessian: second-order (diagonal-Hessian-approximated) channel
+importance -- more principled than Taylor's first-order linear
+approximation (ΔL ≈ grad·Δw only); this adds the 0.5·H·Δw² term via the
+standard diagonal empirical-Fisher approximation (H_cc ≈ E[grad_c²]),
+which reduces to squaring the Taylor saliency. Classic Optimal Brain
+Damage/Surgeon-style saliency, at channel granularity.
+
+--global-pruning: ranks ALL channels across every transformer block
+together with one global threshold, instead of forcing the same ratio
+per layer -- lets pruning concentrate wherever the network can actually
+spare capacity. Compatible with any --criterion (scores are normalized
+per-layer before the global comparison). See compute_global_keep_indices.
+
+Usage: python3 train_pruning_recovery.py [--ratio 0.3] [--n-train 128] [--epochs 20] [--criterion hessian] [--global-pruning] [--recovery-loss relational]
 """
 
 import argparse
@@ -52,7 +65,8 @@ from torch.optim import AdamW
 from emma.data.coco import _stream_samples
 from emma.model_compression import (
     prune_clip_vit_mlps, distillation_loss, relational_distillation_loss,
-    model_size_mb, compute_taylor_importance,
+    model_size_mb, compute_taylor_importance, compute_hessian_importance,
+    compute_global_keep_indices, compute_channel_importance,
 )
 from eval_ptq import build_clip, _cosine_sim, _latency_ms
 from eval_zeroshot_compare import zero_shot_accuracy
@@ -90,12 +104,16 @@ def _parse_args():
                    help="8 was chosen for CPU memory limits during the "
                         "initial investigation -- raise substantially on GPU")
     p.add_argument("--n-zeroshot", type=int, default=200)
-    p.add_argument("--criterion", choices=["l2", "l1", "taylor"], default="l2",
-                   help="taylor uses one calibration forward+backward on CLIP's own "
-                        "contrastive loss instead of weight magnitude (see pruning.py)")
+    p.add_argument("--criterion", choices=["l2", "l1", "taylor", "hessian"], default="l2",
+                   help="taylor/hessian use one calibration forward+backward on CLIP's own "
+                        "contrastive loss instead of weight magnitude (see pruning.py); "
+                        "hessian is taylor's second-order extension")
     p.add_argument("--n-calib", type=int, default=64,
-                   help="calibration batch size for --criterion taylor "
+                   help="calibration batch size for --criterion taylor/hessian "
                         "(a subset of the training images/captions)")
+    p.add_argument("--global-pruning", action="store_true",
+                   help="rank channels across the whole network with one global threshold "
+                        "instead of a fixed ratio per layer (see compute_global_keep_indices)")
     p.add_argument("--recovery-loss", choices=["cosine", "relational"], default="cosine",
                    help="relational matches teacher/student similarity distributions over "
                         "in-batch (image, caption) pairs instead of raw embedding "
@@ -161,8 +179,8 @@ def main():
         train_text_out = _batched_text_forward(text_encoder, train_txt, args.batch_size)
 
     importances = None
-    if args.criterion == "taylor":
-        print(f"\nComputing Taylor importance from a {args.n_calib}-image "
+    if args.criterion in ("taylor", "hessian"):
+        print(f"\nComputing {args.criterion} importance from a {args.n_calib}-image "
               f"calibration batch (CLIP's own contrastive loss)...")
         calib_pv = train_pv[:args.n_calib]
         calib_txt = tok(train_captions[:args.n_calib], max_length=32, padding="max_length",
@@ -170,13 +188,28 @@ def main():
         calib_txt = {k: v.to(DEVICE) for k, v in calib_txt.items()}
         for p in teacher_image.parameters():
             p.requires_grad = True
-        importances = compute_taylor_importance(teacher_image, text_encoder, calib_pv,
-                                                 calib_txt["input_ids"], calib_txt["attention_mask"])
+        importance_fn = compute_taylor_importance if args.criterion == "taylor" else compute_hessian_importance
+        importances = importance_fn(teacher_image, text_encoder, calib_pv,
+                                    calib_txt["input_ids"], calib_txt["attention_mask"])
         for p in teacher_image.parameters():
             p.requires_grad = False
+    elif args.global_pruning:
+        # Global ranking needs every layer's score upfront too, even for
+        # the cheap weight-magnitude criteria -- compute_channel_importance
+        # normally runs lazily inside prune_mlp_pair per layer.
+        importances = [compute_channel_importance(layer.mlp.fc1, args.criterion)
+                       for layer in teacher_image.vision_model.encoder.layers]
+
+    keep_indices = None
+    if args.global_pruning:
+        keep_indices = compute_global_keep_indices(importances, args.ratio)
+        kept_per_layer = [k.numel() for k in keep_indices]
+        print(f"\nGlobal pruning: kept channels per layer = {kept_per_layer} "
+              f"(width={teacher_image.vision_model.encoder.layers[0].mlp.fc1.out_features}, "
+              f"total kept={sum(kept_per_layer)}/{len(kept_per_layer) * teacher_image.vision_model.encoder.layers[0].mlp.fc1.out_features})")
 
     # --- No-recovery baseline (matches eval_pruning.py) ---
-    pruned_only = prune_clip_vit_mlps(teacher_image, args.ratio, args.criterion, importances)
+    pruned_only = prune_clip_vit_mlps(teacher_image, args.ratio, args.criterion, importances, keep_indices)
     pruned_only.eval()
     pruned_only_eval_out = _batched_image_forward(pruned_only, eval_pv, args.batch_size)
     no_recovery_cos = _cosine_sim(teacher_eval_out, pruned_only_eval_out)
@@ -191,8 +224,9 @@ def main():
           f"held-out cos_sim={no_recovery_cos:.4f}  zero-shot acc={no_recovery_acc:.4f}")
 
     # --- Prune + recovery fine-tune ---
-    print(f"\n=== Pruning (ratio={args.ratio}, criterion={args.criterion}) + recovery fine-tuning ===")
-    student = prune_clip_vit_mlps(teacher_image, args.ratio, args.criterion, importances)
+    print(f"\n=== Pruning (ratio={args.ratio}, criterion={args.criterion}, "
+          f"global={args.global_pruning}) + recovery fine-tuning ===")
+    student = prune_clip_vit_mlps(teacher_image, args.ratio, args.criterion, importances, keep_indices)
     for p in student.parameters():
         p.requires_grad = True
     optimizer = AdamW(student.parameters(), lr=args.lr, weight_decay=1e-4)
