@@ -116,5 +116,23 @@ def summarize_onnx_graph(onnx_path: str) -> dict:
     }
 
 
-def build_ort_session(onnx_path: str) -> ort.InferenceSession:
-    return ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+def build_ort_session(onnx_path: str, num_threads: int = 4) -> ort.InferenceSession:
+    """
+    num_threads defaults to 4 to match this project's existing
+    torch.set_num_threads(4) convention (eval_ptq.py/eval_onnx_ptq.py)
+    and the --cpus-per-task=4 used throughout slurm/*.sh.
+
+    Without this, ONNX Runtime auto-detects thread count from the OS's
+    visible logical core count, not the SLURM cgroup's actual allocation
+    -- on a shared GPU node where many more cores are visible than
+    actually usable, this causes severe thread oversubscription/
+    thrashing. Measured effect: real-kernel ONNX latency on a cluster run
+    came back 4-5x SLOWER than the fp32 baseline (should be ~2x faster,
+    per the original sandbox PTQ investigation, which never hit this
+    because it always ran where visible-vs-usable cores matched).
+    """
+    sess_options = ort.SessionOptions()
+    sess_options.intra_op_num_threads = num_threads
+    sess_options.inter_op_num_threads = 1
+    return ort.InferenceSession(onnx_path, sess_options=sess_options,
+                                providers=["CPUExecutionProvider"])
