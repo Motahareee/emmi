@@ -11,6 +11,7 @@ from .pruning import (
     compute_global_keep_indices, prune_mlp_pair, prune_clip_vit_mlps,
     compute_conv_channel_importance, prune_conv_mlp_pair, prune_mobileclip_mlps,
 )
+from .lowrank import compute_low_rank_factors, lowrank_mlp_pair, lowrank_clip_vit_mlps
 
 __all__ = [
     "quantize_encoder_ptq", "model_size_mb", "select_quantized_engine",
@@ -22,4 +23,5 @@ __all__ = [
     "compute_channel_importance", "compute_taylor_importance", "compute_hessian_importance",
     "compute_global_keep_indices", "prune_mlp_pair", "prune_clip_vit_mlps",
     "compute_conv_channel_importance", "prune_conv_mlp_pair", "prune_mobileclip_mlps",
+    "compute_low_rank_factors", "lowrank_mlp_pair", "lowrank_clip_vit_mlps",
 ]
