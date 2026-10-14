@@ -424,6 +424,12 @@ def main():
                 print(f"  [server] Early stopping at epoch {epoch} (no improvement for {PATIENCE} epochs)")
                 break
 
+    best_ckpt = torch.load(os.path.join(CHECKPOINT_DIR, f"best_server_{CKPT_TAG}.pt"), weights_only=False)
+    server.load_state_dict(best_ckpt["server"])
+    audio_encoder.load_state_dict(best_ckpt["audio_encoder"])
+    print(f"\nReloaded best checkpoint from epoch {best_ckpt['epoch']} "
+          f"(val_loss={best_ckpt['val_loss']:.4f})")
+
     print("\nFinal test evaluation...")
     test_m = run_eval_epoch(server, audio_encoder, alignment, cached_loaders["test"], tokenizer)
     print(f"Test | loss {test_m['loss']:.4f} | AVQA accuracy {test_m['avqa_accuracy']:.4f}")
